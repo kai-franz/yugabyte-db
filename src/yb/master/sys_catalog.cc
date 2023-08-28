@@ -1305,8 +1305,9 @@ Status SysCatalogTable::ReadPgClassInfo(
     // From PostgreSQL docs: r = ordinary table, i = index, S = sequence, t = TOAST table,
     // v = view, m = materialized view, c = composite type, f = foreign table,
     // p = partitioned table, I = partitioned index
-    if (relkind != 'r' && relkind != 'i' && relkind != 'p' && relkind != 'I') {
-      // This database object is not a table/index/partitioned table/partitioned index.
+    if (relkind != 'r' && relkind != 'i' && relkind != 'p' && relkind != 'I' && relkind != 'm') {
+      // This database object is not a table/index/partitioned table/partitioned index/
+      // materialized view.
       // Skip this.
       continue;
     }

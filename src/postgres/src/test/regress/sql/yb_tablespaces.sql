@@ -213,12 +213,14 @@ DROP TABLE testschema.test_tab;
 CREATE TABLE testschema.atable AS VALUES (1), (2);
 CREATE UNIQUE INDEX anindex ON testschema.atable(column1);
 ALTER TABLE testschema.atable SET TABLESPACE regress_tblspace;
-/*
 ALTER INDEX testschema.anindex SET TABLESPACE regress_tblspace;
+\d testschema.atable
 ALTER INDEX testschema.part_a_idx SET TABLESPACE pg_global;
+\d testschema.part
 ALTER INDEX testschema.part_a_idx SET TABLESPACE pg_default;
+\d testschema.part
 ALTER INDEX testschema.part_a_idx SET TABLESPACE regress_tblspace;
-*/
+\d testschema.part
 INSERT INTO testschema.atable VALUES(3);
 INSERT INTO testschema.atable VALUES(1);
 SELECT COUNT(*) FROM testschema.atable;

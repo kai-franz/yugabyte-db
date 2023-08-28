@@ -243,3 +243,12 @@ CREATE MATERIALIZED VIEW mv AS SELECT * FROM test_yb;
 CREATE INDEX idx ON mv(t) SPLIT INTO 5 TABLETS;
 REFRESH MATERIALIZED VIEW mv;
 SELECT num_tablets, num_hash_key_columns FROM yb_table_properties('idx'::regclass);
+
+-- Matview with tablespace
+DROP MATERIALIZED VIEW mv;
+CREATE TABLESPACE mv_tblspace1 WITH (replica_placement='{"num_replicas": 1, "placement_blocks": [{"cloud":"cloud1","region":"region1","zone":"zone1","min_num_replicas":1}]}');
+CREATE TABLESPACE mv_tblspace2 WITH (replica_placement='{"num_replicas": 1, "placement_blocks": [{"cloud":"cloud1","region":"region1","zone":"zone1","min_num_replicas":1}]}');
+CREATE MATERIALIZED VIEW mv AS SELECT * FROM test_yb TAABLESPACE mv_tblspace;
+\d mv;
+ALTER MATERIALIZED VIEW mv SET TABLESPACE mv_tblspace2;
+\d mv;
