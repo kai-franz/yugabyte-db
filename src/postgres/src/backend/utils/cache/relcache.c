@@ -2847,19 +2847,6 @@ YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
 		YbRegisterTables(prefetcher, tables, lengthof(tables));
 	}
 
-	if (ctx->is_using_response_cache)
-	{
-		static const YbPFetchTable tables[] = {
-			YB_PFETCH_TABLE_PG_CAST,
-			YB_PFETCH_TABLE_PG_INHERITS,
-			YB_PFETCH_TABLE_PG_POLICY,
-			YB_PFETCH_TABLE_PG_PROC,
-			YB_PFETCH_TABLE_PG_TABLESPACE,
-			YB_PFETCH_TABLE_PG_TRIGGER
-		};
-		YbRegisterTables(prefetcher, tables, lengthof(tables));
-	}
-
 	YBCStatus status = YbPrefetch(prefetcher);
 	if (status)
 		return status;
