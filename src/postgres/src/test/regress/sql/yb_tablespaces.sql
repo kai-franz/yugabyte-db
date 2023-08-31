@@ -220,7 +220,7 @@ ALTER INDEX testschema.part_a_idx SET TABLESPACE pg_global;
 ALTER INDEX testschema.part_a_idx SET TABLESPACE pg_default;
 \d testschema.part
 ALTER INDEX testschema.part_a_idx SET TABLESPACE regress_tblspace;
-\d testschema.part
+\d testschema.part  
 INSERT INTO testschema.atable VALUES(3);
 INSERT INTO testschema.atable VALUES(1);
 SELECT COUNT(*) FROM testschema.atable;

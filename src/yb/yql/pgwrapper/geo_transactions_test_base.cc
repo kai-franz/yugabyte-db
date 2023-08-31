@@ -11,11 +11,14 @@
 // under the License.
 
 #include "yb/client/client.h"
+#include "yb/client/transaction.h"
 #include "yb/client/transaction_manager.h"
 #include "yb/client/transaction_pool.h"
 #include "yb/client/yb_table_name.h"
 
 #include "yb/master/catalog_entity_info.pb.h"
+#include "yb/master/catalog_manager.h"
+#include "yb/master/mini_master.h"
 #include "yb/master/master_defaults.h"
 
 #include "yb/tserver/tablet_server.h"
@@ -303,6 +306,246 @@ Status GeoTransactionsTestBase::StartShutdownTabletServers(
   }
   return Status::OK();
 }
+
+// Sets up a table by doing CREATE TABLE followed by ALTER TABLE SET TABLESPACE.
+  void GeoTransactionsTestBase::SetupTablesWithAlter(size_t tables_per_region) {
+    // Create tablespaces and tables.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = true;
+    tables_per_region_ = tables_per_region;
+
+    auto conn = ASSERT_RESULT(Connect());
+    bool wait_for_version = ANNOTATE_UNPROTECTED_READ(FLAGS_auto_create_local_transaction_tables);
+    auto current_version = GetCurrentVersion();
+    for (size_t i = 1; i <= NumRegions(); ++i) {
+      ASSERT_OK(conn.ExecuteFormat(R"#(
+          CREATE TABLESPACE tablespace$0 WITH (replica_placement='{
+            "num_replicas": 1,
+            "placement_blocks":[{
+              "cloud": "cloud0",
+              "region": "rack$0",
+              "zone": "zone",
+              "min_num_replicas": 1
+            }]
+          }')
+      )#", i));
+
+      for (size_t j = 1; j <= tables_per_region; ++j) {
+        ASSERT_OK(conn.ExecuteFormat(
+            "CREATE TABLE $0$1_$2(value int)", kTablePrefix, i, j));
+        ASSERT_OK(conn.ExecuteFormat(
+            "ALTER TABLE $0$1_$2 SET TABLESPACE tablespace$1", kTablePrefix, i, j));
+      }
+
+      WaitForLoadBalanceCompletion();
+      if (wait_for_version) {
+        WaitForStatusTabletsVersion(current_version + 1);
+        ++current_version;
+      }
+    }
+  }
+
+  // Checks that for all tablets in tablet_uuids, their leaders are all in the given region.
+  void GeoTransactionsTestBase::ValidateAllTabletLeaderinZone(std::vector<TabletId> tablet_uuids,
+                                                              int region) {
+    std::string region_str = yb::Format("rack$0", region);
+    auto& catalog_manager = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager();
+    for (const auto& tablet_id : tablet_uuids) {
+      auto table_info = ASSERT_RESULT(catalog_manager.GetTabletInfo(tablet_id));
+      auto leader = ASSERT_RESULT(table_info->GetLeader());
+      auto server_reg_pb = leader->GetRegistration();
+      ASSERT_EQ(server_reg_pb.common().cloud_info().placement_region(), region_str);
+    }
+  }
+
+  Result<uint32_t> GeoTransactionsTestBase::GetTablespaceOidForRegion(int region) {
+    auto conn = EXPECT_RESULT(Connect());
+    uint32_t tablespace_oid = EXPECT_RESULT(conn.FetchValue<int32_t>(strings::Substitute(
+        "SELECT oid FROM pg_catalog.pg_tablespace WHERE spcname = 'tablespace$0'", region)));
+    return tablespace_oid;
+  }
+
+  Result<std::vector<TabletId>> GeoTransactionsTestBase::GetStatusTablets(int region,
+      ExpectedLocality locality) {
+    YBTableName table_name;
+    if (locality == ExpectedLocality::kNoCheck) {
+      return std::vector<TabletId>();
+    } else if (locality == ExpectedLocality::kGlobal) {
+      table_name = YBTableName(
+          YQL_DATABASE_CQL, master::kSystemNamespaceName, kGlobalTransactionsTableName);
+    } else if (ANNOTATE_UNPROTECTED_READ(FLAGS_auto_create_local_transaction_tables)) {
+      auto tablespace_oid = EXPECT_RESULT(GetTablespaceOidForRegion(region));
+      table_name = YBTableName(
+          YQL_DATABASE_CQL, master::kSystemNamespaceName,
+          yb::Format("transactions_$0", tablespace_oid));
+    } else {
+      table_name = YBTableName(
+          YQL_DATABASE_CQL, master::kSystemNamespaceName,
+          yb::Format("transactions_region$0", region));
+    }
+    std::vector<TabletId> tablet_uuids;
+    RETURN_NOT_OK(client_->GetTablets(
+        table_name, 1000 /* max_tablets */, &tablet_uuids, nullptr /* ranges */));
+    return tablet_uuids;
+  }
+
+  void GeoTransactionsTestBase::CheckSuccess(int to_region,
+                   SetGlobalTransactionsGFlag set_global_transactions_gflag,
+                   SetGlobalTransactionSessionVar session_var, InsertToLocalFirst local_first,
+                   ExpectedLocality expected) {
+    auto expected_status_tablets = ASSERT_RESULT(GetStatusTablets(to_region, expected));
+    if (expected != ExpectedLocality::kNoCheck) {
+      ASSERT_FALSE(expected_status_tablets.empty());
+    }
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) =
+        (set_global_transactions_gflag == SetGlobalTransactionsGFlag::kTrue);
+
+    auto conn = ASSERT_RESULT(Connect());
+    ASSERT_OK(conn.ExecuteFormat("SET force_global_transaction = $0", ToString(session_var)));
+    ASSERT_OK(conn.StartTransaction(IsolationLevel::SERIALIZABLE_ISOLATION));
+    if (local_first) {
+      ASSERT_OK(conn.ExecuteFormat(
+          "INSERT INTO $0$1_1(value) VALUES (0)", kTablePrefix, kLocalRegion));
+    }
+    ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0$1_1(value) VALUES (0)", kTablePrefix, to_region));
+    ASSERT_OK(conn.CommitTransaction());
+
+    if (expected != ExpectedLocality::kNoCheck) {
+      auto last_transaction = transaction_pool_->TEST_GetLastTransaction();
+      auto metadata = last_transaction->GetMetadata(TransactionRpcDeadline()).get();
+      ASSERT_OK(metadata);
+      ASSERT_TRUE(std::find(expected_status_tablets.begin(),
+                            expected_status_tablets.end(),
+                            metadata->status_tablet) != expected_status_tablets.end());
+    }
+
+    ASSERT_OK(conn.StartTransaction(IsolationLevel::SERIALIZABLE_ISOLATION));
+    if (local_first) {
+      ASSERT_OK(conn.FetchFormat("SELECT * FROM $0$1_1", kTablePrefix, kLocalRegion));
+    }
+    ASSERT_OK(conn.FetchFormat("SELECT * FROM $0$1_1", kTablePrefix, to_region));
+    ASSERT_OK(conn.CommitTransaction());
+
+    if (expected != ExpectedLocality::kNoCheck) {
+      auto last_transaction = transaction_pool_->TEST_GetLastTransaction();
+      auto metadata = last_transaction->GetMetadata(TransactionRpcDeadline()).get();
+      ASSERT_OK(metadata);
+      ASSERT_TRUE(std::find(expected_status_tablets.begin(),
+                            expected_status_tablets.end(),
+                            metadata->status_tablet) != expected_status_tablets.end());
+    }
+
+    ASSERT_OK(conn.StartTransaction(IsolationLevel::READ_COMMITTED));
+    if (local_first) {
+      ASSERT_OK(conn.FetchFormat("SELECT * FROM $0$1_1", kTablePrefix, kLocalRegion));
+    }
+    ASSERT_OK(conn.FetchFormat("SELECT * FROM $0$1_1", kTablePrefix, to_region));
+    ASSERT_OK(conn.CommitTransaction());
+  }
+
+  void GeoTransactionsTestBase::CheckAbort(int to_region,
+                  SetGlobalTransactionsGFlag set_global_transactions_gflag,
+                  SetGlobalTransactionSessionVar session_var, InsertToLocalFirst local_first,
+                  size_t num_aborts) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = set_global_transactions_gflag;
+
+    auto conn = ASSERT_RESULT(Connect());
+    ASSERT_OK(conn.ExecuteFormat("SET force_global_transaction = $0", ToString(session_var)));
+    for (size_t i = 0; i < num_aborts; ++i) {
+      ASSERT_OK(conn.StartTransaction(IsolationLevel::SERIALIZABLE_ISOLATION));
+      if (local_first) {
+        ASSERT_OK(conn.ExecuteFormat(
+            "INSERT INTO $0$1_1(value) VALUES (0)", kTablePrefix, kLocalRegion));
+      }
+      ASSERT_NOK(conn.ExecuteFormat(
+          "INSERT INTO $0$1_1(value) VALUES (0)", kTablePrefix, to_region));
+      ASSERT_OK(conn.RollbackTransaction());
+    }
+
+    for (size_t i = 0; i < num_aborts; ++i) {
+      ASSERT_OK(conn.StartTransaction(IsolationLevel::SERIALIZABLE_ISOLATION));
+      if (local_first) {
+        ASSERT_OK(conn.FetchFormat("SELECT * FROM $0$1_1", kTablePrefix, kLocalRegion));
+      }
+      ASSERT_NOK(conn.FetchFormat("SELECT * FROM $0$1_1", kTablePrefix, to_region));
+      ASSERT_OK(conn.RollbackTransaction());
+    }
+
+    for (size_t i = 0; i < num_aborts; ++i) {
+      ASSERT_OK(conn.StartTransaction(IsolationLevel::READ_COMMITTED));
+      if (local_first) {
+        ASSERT_OK(conn.FetchFormat("SELECT * FROM $0$1_1", kTablePrefix, kLocalRegion));
+      }
+      ASSERT_OK(conn.FetchFormat("SELECT * FROM $0$1_1", kTablePrefix, to_region));
+      ASSERT_OK(conn.CommitTransaction());
+    }
+  }
+
+  // Get the leader replica count and total replica count of a group of tablets belongs to a table
+  // on a tserver.
+  Result<std::pair<size_t, size_t>> GeoTransactionsTestBase::GetTServerReplicaCount(
+      tserver::MiniTabletServer* tserver,
+      const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets) {
+    size_t leader_count = 0;
+    size_t total_count = 0;
+
+    for (const auto& tablet : tablets) {
+      for (const auto& replica : tablet.replicas()) {
+        if (replica.ts_info().permanent_uuid() == tserver->server()->permanent_uuid()) {
+          if (replica.role() == PeerRole::LEADER) {
+            leader_count++;
+          }
+          total_count++;
+        }
+      }
+    }
+    return std::make_pair(leader_count, total_count);
+  }
+
+  // Verify that the replicas of each table are evenly distributed across zones.
+  Result<bool> GeoTransactionsTestBase::VerifyTableReplicaDistributionInZone(
+      const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
+      const std::vector<size_t>& current_zone_tserver_indexes,
+      bool is_table_in_current_zone) {
+    const auto expected_leaders_per_server = tablets.size() / current_zone_tserver_indexes.size();
+    for (auto tserver_idx : current_zone_tserver_indexes) {
+      const auto& [leader_count, total_count] =
+          VERIFY_RESULT(GetTServerReplicaCount(cluster_->mini_tablet_server(tserver_idx), tablets));
+
+      if (is_table_in_current_zone) {
+        // If table is pinned to the same zone as this tserver, check that replicas are evenly
+        // distributed.
+        if (leader_count != expected_leaders_per_server ||
+            static_cast<int>(total_count) != tablets.size()) {
+          return false;
+        }
+      } else if (total_count != 0) {
+        // If table is pinned to a different zone and has replicas on this tserver, then load
+        // balancer is not respecting tablespaces.
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Verify the replicas of each table should be evenly distributed across each zone.
+  Result<bool> GeoTransactionsTestBase::VerifyReplicaDistribution(
+      const std::vector<YBTableName> tables,
+      const std::vector<std::pair<std::string, std::vector<size_t>>>& servers_group_by_zone) {
+    for (const auto& table : tables) {
+      google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+      RETURN_NOT_OK(
+          client_->GetTabletsFromTableId(table.table_id(), /* max_tablets = */ 0, &tablets));
+      for (const auto& [current_zone_table_name, current_zone_tserver_indexes] :
+           servers_group_by_zone) {
+        bool is_table_in_current_zone = table.table_name() == current_zone_table_name;
+        if (!VERIFY_RESULT(VerifyTableReplicaDistributionInZone(
+                tablets, current_zone_tserver_indexes, is_table_in_current_zone))) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
 
 } // namespace client
 } // namespace yb

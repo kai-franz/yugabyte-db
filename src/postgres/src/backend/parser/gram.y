@@ -339,7 +339,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 				opt_nulls_order
 
 %type <node>	alter_table_cmd alter_type_cmd opt_collate_clause
-	   replica_identity partition_cmd index_partition_cmd yb_alter_index_cmd
+	   replica_identity partition_cmd index_partition_cmd
 %type <list>	alter_table_cmds alter_type_cmds
 %type <list>    alter_identity_column_option_list
 %type <defelt>  alter_identity_column_option
@@ -2722,17 +2722,6 @@ alter_table_cmd:
 					$$ = (Node *) n;
 				}
 		;
-
-yb_alter_index_cmd:
-			/* ALTER TABLE <name> SET TABLESPACE <tablespacename> */
-			SET TABLESPACE name
-				{
-					parser_ybc_beta_feature(@1, "tablespace_alteration", true);
-					AlterTableCmd *n = makeNode(AlterTableCmd);
-					n->subtype = AT_SetTableSpace;
-					n->name = $3;
-					$$ = (Node *)n;
-				}
 
 alter_column_default:
 			SET DEFAULT a_expr			{ $$ = $3; }
