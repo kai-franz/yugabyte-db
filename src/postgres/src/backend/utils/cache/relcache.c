@@ -5600,8 +5600,7 @@ RelationCacheInitializePhase3(void)
 
 		bool preload_rel_cache =
 			needNewCacheFile ||
-			YBCIsInitDbModeEnvVarSet() ||
-			*YBCGetGFlags()->ysql_enable_read_request_caching;
+			YBCIsInitDbModeEnvVarSet();
 		YbPrefetchRequiredData(preload_rel_cache);
 
 		Assert(YBCIsSysTablePrefetchingStarted());
