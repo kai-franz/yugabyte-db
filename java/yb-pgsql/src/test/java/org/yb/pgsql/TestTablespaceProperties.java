@@ -408,7 +408,7 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     try (Statement setupStatement = connection.createStatement()) {
       // Create a tablespace specifying a cloud that does not exist.
       setupStatement.execute(
-          "CREATE TABLESPACE invalid_tblspc WITH (replica_placement=" +
+        "CREATE TABLESPACE invalid_tblspc WITH (replica_placement=" +
           "'{\"num_replicas\":2, \"placement_blocks\":" +
           "[{\"cloud\":\"cloud3\",\"region\":\"region1\",\"zone\":\"zone1\"," +
           "\"min_num_replicas\":1}," +
@@ -418,8 +418,17 @@ public class TestTablespaceProperties extends BasePgSQLTest {
       // Create a tablespace wherein the individual min_num_replicas can be
       // satisfied, but the total replication factor cannot.
       setupStatement.execute(
-          "CREATE TABLESPACE insufficient_rf_tblspc WITH (replica_placement=" +
+        "CREATE TABLESPACE insufficient_rf_tblspc WITH (replica_placement=" +
           "'{\"num_replicas\":5, \"placement_blocks\":" +
+          "[{\"cloud\":\"cloud1\",\"region\":\"region1\",\"zone\":\"zone1\"," +
+          "\"min_num_replicas\":1}," +
+          "{\"cloud\":\"cloud2\",\"region\":\"region2\",\"zone\":\"zone2\"," +
+          "\"min_num_replicas\":1}]}')");
+
+      // Create a valid tablespace.
+      setupStatement.execute(
+        "CREATE TABLESPACE valid_tblspc WITH (replica_placement=" +
+          "'{\"num_replicas\":2, \"placement_blocks\":" +
           "[{\"cloud\":\"cloud1\",\"region\":\"region1\",\"zone\":\"zone1\"," +
           "\"min_num_replicas\":1}," +
           "{\"cloud\":\"cloud2\",\"region\":\"region2\",\"zone\":\"zone2\"," +
@@ -457,7 +466,61 @@ public class TestTablespaceProperties extends BasePgSQLTest {
       "CREATE TABLEGROUP insufficientRfTablegroup TABLESPACE insufficient_rf_tblspc",
       not_enough_tservers_msg);
 
-    testTableCreationFailure();
+    // Test creation of index when the replication factor cannot be satisfied.
+    executeAndAssertErrorThrown(
+      "CREATE INDEX invalidPlacementIdx ON negativeTestTable(a) " +
+        "TABLESPACE insufficient_rf_tblspc",
+      not_enough_tservers_msg);
+
+    // Test creation of materialized view when the replication factor cannot be satisfied.
+    executeAndAssertErrorThrown(
+      "CREATE MATERIALIZED VIEW invalidPlacementMv TABLESPACE insufficient_rf_tblspc AS " +
+        "SELECT * FROM negativeTestTable",
+      not_enough_tservers_msg);
+
+    // Test ALTER ... SET TABLESPACE
+
+    // Create a table, index, and materialized view in the valid tablespace.
+    try (Statement setupStatement = connection.createStatement()) {
+      setupStatement.execute(
+        "CREATE TABLE validPlacementTable (a int) TABLESPACE valid_tblspc");
+      setupStatement.execute(
+        "CREATE INDEX validPlacementIdx ON validPlacementTable(a) TABLESPACE valid_tblspc");
+      setupStatement.execute(
+        "CREATE MATERIALIZED VIEW validPlacementMv TABLESPACE valid_tblspc AS " +
+          "SELECT * FROM validPlacementTable");
+    }
+
+    // Test ALTER ... SET TABLESPACE to invalid tablespace.
+    executeAndAssertErrorThrown(
+      "ALTER TABLE validPlacementTable SET TABLESPACE invalid_tblspc",
+      not_enough_tservers_msg);
+
+    executeAndAssertErrorThrown(
+      "ALTER INDEX validPlacementIdx SET TABLESPACE invalid_tblspc",
+      not_enough_tservers_msg);
+
+    executeAndAssertErrorThrown(
+      "ALTER MATERIALIZED VIEW validPlacementMv SET TABLESPACE invalid_tblspc",
+      not_enough_tservers_msg);
+
+    // Test ALTER ... SET TABLESPACE to insufficient replication factor tablespace.
+    executeAndAssertErrorThrown(
+      "ALTER TABLE validPlacementTable SET TABLESPACE insufficient_rf_tblspc",
+      not_enough_tservers_msg);
+
+    executeAndAssertErrorThrown(
+      "ALTER INDEX validPlacementIdx SET TABLESPACE insufficient_rf_tblspc",
+      not_enough_tservers_msg);
+
+    executeAndAssertErrorThrown(
+      "ALTER MATERIALIZED VIEW validPlacementMv SET TABLESPACE insufficient_rf_tblspc",
+      not_enough_tservers_msg);
+
+    // Reset YB-Master flags.
+    for (HostAndPort hp : miniCluster.getMasters().keySet()) {
+      assertTrue(client.setFlag(hp, "enable_ysql_tablespaces_for_placement", "false"));
+    }
   }
 
   public void executeAndAssertErrorThrown(String statement, String err_msg) throws Exception{
@@ -474,6 +537,7 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     assertTrue(error_thrown);
   }
 
+  @Test
   public void testTableCreationFailure() throws Exception {
     final YBClient client = miniCluster.getClient();
     int previousBGWait = MiniYBCluster.CATALOG_MANAGER_BG_TASK_WAIT_MS;
