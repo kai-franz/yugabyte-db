@@ -80,6 +80,13 @@ class PlacementBlock {
     return json;
   }
 
+  // Checks if the cloud, region, and zone match those of a CloudInfo protobuf.
+  bool MatchesReplica(const CloudInfoPB& replica_cloud_info) const {
+    return replica_cloud_info.placement_cloud() == cloud &&
+           replica_cloud_info.placement_region() == region &&
+           replica_cloud_info.placement_zone() == zone;
+  }
+
  private:
     /*
     * Returns the JSON representation of the placement block. For example:
@@ -120,6 +127,10 @@ class Tablespace {
       placementBlocks(placementBlocks) {
         json = generateJson();
         createCmd = generateCreateCmd();
+    }
+
+    const std::vector<PlacementBlock> &getPlacementBlocks() const {
+        return placementBlocks;
     }
 
     const std::string &toJson() const {
@@ -169,8 +180,51 @@ class Tablespace {
     }
 };
 
-class PgTablespacesTest : public GeoTransactionsTestBase {};
+class PgTablespacesTest : public GeoTransactionsTestBase {
+public:
+  // Helper function to get tablets for a given table.
+  Result<google::protobuf::RepeatedPtrField<master::TabletLocationsPB>> GetTabletsForTable(const std::string& table_name) {
+    google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+    const auto yb_table_names = VERIFY_RESULT(client_->ListTables(table_name));
+    
+    if (yb_table_names.size() != 1) {
+      return STATUS(InvalidArgument, "Expected exactly one table with name " + table_name);
+    }
+    const auto& yb_table = yb_table_names[0];
 
+    YB_RETURN_NOT_OK(client_->GetTabletsFromTableId(yb_table.table_id(), /* max_tablets = */ 0, &tablets));
+    return tablets;
+  }
+
+  // Get the number of replicas that are placed in the given block.
+  long CountMatchingReplicas(const std::vector<CloudInfoPB>& replica_cloud_infos, const PlacementBlock& placement_block) {
+    return std::count_if(replica_cloud_infos.begin(), replica_cloud_infos.end(),
+                          [&placement_block](const CloudInfoPB& replica_cloud_info) {
+                            return placement_block.MatchesReplica(replica_cloud_info);
+                          });
+  }
+
+
+  // Given a table name and a list of placement blocks, verify that the tablets satisfy
+  // the minimum number of replicas in each placement block.
+  void VerifyMinNumReplicas(const std::string& table_name, const std::vector<PlacementBlock>& placement_blocks) {
+    auto tablets = ASSERT_RESULT(GetTabletsForTable(table_name));
+    for (const auto& tablet : tablets) {
+      std::vector<CloudInfoPB> replica_cloud_infos;
+      for (const auto& replica : tablet.replicas()) {
+        replica_cloud_infos.push_back(replica.ts_info().cloud_info());
+      }
+
+      for (const auto& placement_block : placement_blocks) {
+        long num_matching_replicas = CountMatchingReplicas(replica_cloud_infos, placement_block);
+        ASSERT_GE(num_matching_replicas, placement_block.minNumReplicas)
+            << "Could not find replica with placement: " << placement_block.toJson();
+      }
+    }
+  }
+};
+
+// Test that the leader preference is respected for indexes.
 TEST_F(PgTablespacesTest, YB_DISABLE_TEST_IN_TSAN(TestIndexPreferredZone)) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = false;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_create_local_transaction_tables) = true;
@@ -188,9 +242,11 @@ TEST_F(PgTablespacesTest, YB_DISABLE_TEST_IN_TSAN(TestIndexPreferredZone)) {
 
   // In tablespace 1, region 1 is most preferred.
   // In tablespace 2, region 3 is most preferred, with region 1 being the next most preferred.
-  for (size_t i = 1; i <= NumRegions(); ++i) {
-    placement_blocks_1.emplace_back(i, 1, i);
-    placement_blocks_2.emplace_back(i, 1, i == NumRegions() ? 1 : (i + 1));
+  for (size_t region_id = 1; region_id <= NumRegions(); ++region_id) {
+    placement_blocks_1.emplace_back(region_id, /* minNumReplicas = */ 1, 
+                                    /* leaderPreference = */ region_id);
+    placement_blocks_2.emplace_back(region_id, /* minNumReplicas = */ 1, 
+                                    /* leaderPreference = */ region_id == NumRegions() ? 1 : (region_id + 1));
   }
 
   size_t num_replicas = NumTabletServers();
@@ -239,6 +295,7 @@ TEST_F(PgTablespacesTest, YB_DISABLE_TEST_IN_TSAN(TestIndexPreferredZone)) {
   ValidateAllTabletLeaderinZone(status_tablet_ids, 1);
 }
 
+// Test that the leader preference is respected for materialized views.
 TEST_F(PgTablespacesTest, YB_DISABLE_TEST_IN_TSAN(TestMatViewPreferredZone)) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = false;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_create_local_transaction_tables) = true;
@@ -254,12 +311,13 @@ TEST_F(PgTablespacesTest, YB_DISABLE_TEST_IN_TSAN(TestMatViewPreferredZone)) {
   std::vector<PlacementBlock> placement_blocks_1;
   std::vector<PlacementBlock> placement_blocks_2;
 
-  // Tablespace 1 has the highest leader preference for region 1.
-  // Tablespace 2 has the highest leader preference for region 2, with
-  // region 1 being the next highest.
-  for (size_t i = 1; i <= NumRegions(); ++i) {
-    placement_blocks_1.emplace_back(i, 1, i);
-    placement_blocks_2.emplace_back(i, 1, i == NumRegions() ? 1 : (i + 1));
+  // In tablespace 1, region 1 is most preferred.
+  // In tablespace 2, region 3 is most preferred, with region 1 being the next most preferred.
+  for (size_t region_id = 1; region_id <= NumRegions(); ++region_id) {
+    placement_blocks_1.emplace_back(region_id, /* minNumReplicas = */ 1, 
+                                    /* leaderPreference = */ region_id);
+    placement_blocks_2.emplace_back(region_id, /* minNumReplicas = */ 1, 
+                                    /* leaderPreference = */ region_id == NumRegions() ? 1 : (region_id + 1));
   }
 
   size_t num_replicas = NumTabletServers();
@@ -306,6 +364,194 @@ TEST_F(PgTablespacesTest, YB_DISABLE_TEST_IN_TSAN(TestMatViewPreferredZone)) {
   // for tablespace 2.
   ValidateAllTabletLeaderinZone(mv_uuids, 1);
   ValidateAllTabletLeaderinZone(status_tablet_ids, 1);
+}
+
+// Test that we can ALTER TABLE SET TABLESPACE to a tablespace that has a majority, but not all,
+// of the placement blocks available.
+TEST_F(PgTablespacesTest, YB_DISABLE_TEST_IN_TSAN(TestAlterTableMajority)) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_create_local_transaction_tables) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_tables_use_preferred_zones) = true;
+
+  // Create tablespaces and tables.
+  auto conn = ASSERT_RESULT(Connect());
+  auto current_version = GetCurrentVersion();
+  string table_name = kTablePrefix;
+
+  // Create two tablespaces.
+  // valid_ts has all the placement blocks available.
+  // majority_ts has all but one of the placement blocks available.
+  std::vector<PlacementBlock> valid_placement_blocks;
+  for (size_t region_id = 1; region_id <= NumRegions(); ++region_id) {
+    // For simplicity, set the leader preference to be the same as the region ID.
+    size_t leader_preference = region_id;
+    valid_placement_blocks.emplace_back(region_id, /* minNumReplicas = */ 1, leader_preference);
+  }
+
+  // The first two placement blocks should available.
+  std::vector<PlacementBlock> majority_placement_blocks;
+  for (size_t region_id = 1; region_id < NumRegions(); ++region_id) {
+    size_t leader_preference = region_id;
+    majority_placement_blocks.emplace_back(region_id, /* minNumReplicas = */ 1, leader_preference);
+  }
+  
+  // Make a copy of the valid blocks so we can use it to verify the placement.
+  std::vector<PlacementBlock> valid_majority_placement_blocks = majority_placement_blocks;
+
+  // The third placement block is not available.
+  majority_placement_blocks.emplace_back(0, 1, 1);
+
+  const size_t total_num_replicas = NumTabletServers();
+  Tablespace valid_ts("valid_ts", total_num_replicas, valid_placement_blocks);
+  Tablespace majority_ts("majority_ts", total_num_replicas, valid_placement_blocks);
+
+  ASSERT_OK(conn.Execute(valid_ts.getCreateCmd()));
+  ASSERT_OK(conn.Execute(majority_ts.getCreateCmd()));
+
+  // Create a table in the valid tablespace.
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0(value int) TABLESPACE valid_ts", table_name));
+
+  // WaitForStatusTabletsVersion(++current_version);
+  WaitForLoadBalanceCompletion();
+
+  // Verify that the replicas for the table are distributed in valid_ts.
+  VerifyMinNumReplicas(table_name, valid_placement_blocks);
+
+  // This ALTER TABLE should succeed because the majority (2/3) of the placement blocks are available.
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 SET TABLESPACE majority_ts", table_name));
+
+  WaitForStatusTabletsVersion(++current_version);
+  WaitForLoadBalanceCompletion();
+
+  // Verify that there are replicas in the two valid placement blocks.
+  VerifyMinNumReplicas(table_name, valid_majority_placement_blocks);
+}
+
+// Test that we can ALTER TABLE SET TABLESPACE to a tablespace that has a majority, but not all,
+// of the placement blocks available.
+TEST_F(PgTablespacesTest, YB_DISABLE_TEST_IN_TSAN(TestAlterIndexMajority)) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_create_local_transaction_tables) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_tables_use_preferred_zones) = true;
+
+  // Create tablespaces and tables.
+  auto conn = ASSERT_RESULT(Connect());
+  auto current_version = GetCurrentVersion();
+  string table_name = kTablePrefix;
+  string index_name = table_name + "_idx";
+
+  // Create two tablespaces.
+  // valid_ts has all the placement blocks available.
+  // majority_ts has all but one of the placement blocks available.
+  std::vector<PlacementBlock> valid_placement_blocks;
+  for (size_t region_id = 1; region_id <= NumRegions(); ++region_id) {
+    // For simplicity, set the leader preference to be the same as the region ID.
+    size_t leader_preference = region_id;
+    valid_placement_blocks.emplace_back(region_id, /* minNumReplicas = */ 1, leader_preference);
+  }
+
+  // The first two placement blocks should available.
+  std::vector<PlacementBlock> majority_placement_blocks;
+  for (size_t region_id = 1; region_id < NumRegions(); ++region_id) {
+    size_t leader_preference = region_id;
+    majority_placement_blocks.emplace_back(region_id, /* minNumReplicas = */ 1, leader_preference);
+  }
+  
+  // Make a copy of the valid blocks so we can use it to verify the placement.
+  std::vector<PlacementBlock> valid_majority_placement_blocks = majority_placement_blocks;
+
+  // The third placement block is not available.
+  majority_placement_blocks.emplace_back(0, 1, 1);
+
+  const size_t total_num_replicas = NumTabletServers();
+  Tablespace valid_ts("valid_ts", total_num_replicas, valid_placement_blocks);
+  Tablespace majority_ts("majority_ts", total_num_replicas, valid_placement_blocks);
+
+  ASSERT_OK(conn.Execute(valid_ts.getCreateCmd()));
+  ASSERT_OK(conn.Execute(majority_ts.getCreateCmd()));
+
+  // Create a table in the valid tablespace.
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0(value int)", table_name));
+  ASSERT_OK(conn.ExecuteFormat("CREATE INDEX $0 ON $1(value) TABLESPACE valid_ts", index_name, table_name));
+
+  WaitForStatusTabletsVersion(++current_version);
+  WaitForLoadBalanceCompletion();
+
+  // Verify that the replicas for the table are distributed in valid_ts.
+  VerifyMinNumReplicas(index_name, valid_placement_blocks);
+
+  // This ALTER TABLE should succeed because the majority (2/3) of the placement blocks are available.
+  ASSERT_OK(conn.ExecuteFormat("ALTER INDEX $0 SET TABLESPACE majority_ts", index_name));
+
+  WaitForStatusTabletsVersion(++current_version);
+  WaitForLoadBalanceCompletion();
+
+  // Verify that there are replicas in the two valid placement blocks.
+  VerifyMinNumReplicas(index_name, valid_majority_placement_blocks);
+}
+
+
+// Test that we can ALTER TABLE SET TABLESPACE to a tablespace that has a majority, but not all,
+// of the placement blocks available.
+TEST_F(PgTablespacesTest, YB_DISABLE_TEST_IN_TSAN(TestAlterMatViewMajority)) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_create_local_transaction_tables) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_tables_use_preferred_zones) = true;
+
+  // Create tablespaces and tables.
+  auto conn = ASSERT_RESULT(Connect());
+  auto current_version = GetCurrentVersion();
+  string table_name = kTablePrefix;
+  string mv_name = table_name + "_mv";
+
+  // Create two tablespaces.
+  // valid_ts has all the placement blocks available.
+  // majority_ts has all but one of the placement blocks available.
+  std::vector<PlacementBlock> valid_placement_blocks;
+  for (size_t region_id = 1; region_id <= NumRegions(); ++region_id) {
+    // For simplicity, set the leader preference to be the same as the region ID.
+    size_t leader_preference = region_id;
+    valid_placement_blocks.emplace_back(region_id, /* minNumReplicas = */ 1, leader_preference);
+  }
+
+  // The first two placement blocks should available.
+  std::vector<PlacementBlock> majority_placement_blocks;
+  for (size_t region_id = 1; region_id < NumRegions(); ++region_id) {
+    size_t leader_preference = region_id;
+    majority_placement_blocks.emplace_back(region_id, /* minNumReplicas = */ 1, leader_preference);
+  }
+  
+  // Make a copy of the valid blocks so we can use it to verify the placement.
+  std::vector<PlacementBlock> valid_majority_placement_blocks = majority_placement_blocks;
+
+  // The third placement block is not available.
+  majority_placement_blocks.emplace_back(0, 1, 1);
+
+  const size_t total_num_replicas = NumTabletServers();
+  Tablespace valid_ts("valid_ts", total_num_replicas, valid_placement_blocks);
+  Tablespace majority_ts("majority_ts", total_num_replicas, valid_placement_blocks);
+
+  ASSERT_OK(conn.Execute(valid_ts.getCreateCmd()));
+  ASSERT_OK(conn.Execute(majority_ts.getCreateCmd()));
+
+  // Create a table in the valid tablespace.
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0(value int)", table_name));
+  ASSERT_OK(conn.ExecuteFormat("CREATE MATERIALIZED VIEW $0 TABLESPACE valid_ts AS SELECT * FROM $1", mv_name, table_name));
+
+  WaitForStatusTabletsVersion(++current_version);
+  WaitForLoadBalanceCompletion();
+
+  // Verify that the replicas for the table are distributed in valid_ts.
+  VerifyMinNumReplicas(mv_name, valid_placement_blocks);
+
+  // This ALTER TABLE should succeed because the majority (2/3) of the placement blocks are available.
+  ASSERT_OK(conn.ExecuteFormat("ALTER MATERIALIZED VIEW $0 SET TABLESPACE majority_ts", mv_name));
+
+  WaitForStatusTabletsVersion(++current_version);
+  WaitForLoadBalanceCompletion();
+
+  // Verify that there are replicas in the two valid placement blocks.
+  VerifyMinNumReplicas(mv_name, valid_majority_placement_blocks);
 }
 
 } // namespace client
