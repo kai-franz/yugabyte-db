@@ -268,26 +268,37 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     }
     final String colocatedTableName = "colocated_table";
     final String nonColocatedTable = "colocation_opt_out_table";
+    final String nonColocatedIndex = "colocation_opt_out_idx";
     try (Connection connection2 = getConnectionBuilder().withDatabase(dbname).connect();
          Statement stmt = connection2.createStatement()) {
       stmt.execute(String.format("CREATE TABLE %s (h INT PRIMARY KEY, a INT, b FLOAT) " +
                                  "WITH (colocated = false) TABLESPACE testTablespace",
                                  nonColocatedTable));
+      stmt.execute(String.format("CREATE INDEX %s ON %s (a) TABLESPACE testTablespace",
+        nonColocatedIndex, nonColocatedTable));
       stmt.execute(String.format("CREATE TABLE %s (h INT PRIMARY KEY, a INT, b FLOAT)",
                                  colocatedTableName));
     }
-    verifyDefaultPlacement(colocatedTableName);
-    verifyCustomPlacement(nonColocatedTable);
-
-    // Wait for tablespace info to be refreshed in load balancer.
-    Thread.sleep(5 * MASTER_REFRESH_TABLESPACE_INFO_SECS);
-
-    // Verify that load balancer is indeed idle.
-    assertTrue(miniCluster.getClient().waitForLoadBalancerIdle(
-               MASTER_LOAD_BALANCER_WAIT_TIME_MS));
 
     verifyDefaultPlacement(colocatedTableName);
     verifyCustomPlacement(nonColocatedTable);
+
+//     Test that ALTER ... SET TABLESPACE works on the non-colocated table/index.
+    String ts1Name = "testTablespaceOptOutColocation";
+    PlacementBlock block1 = new PlacementBlock("cloud1", "region1", "zone1", 1);
+    Tablespace ts1 = new Tablespace(ts1Name, 1, Collections.singletonList(block1));
+    ts1.create();
+
+    try (Connection connection2 = getConnectionBuilder().withDatabase(dbname).connect();
+         Statement stmt = connection2.createStatement()) {
+      stmt.execute(String.format("ALTER TABLE %s SET TABLESPACE %s",
+        nonColocatedTable, ts1Name));
+      stmt.execute(String.format("ALTER INDEX %s SET TABLESPACE %s",
+        nonColocatedIndex, ts1Name));
+    }
+
+    verifyCustomPlacement(nonColocatedTable, ts1);
+    verifyCustomPlacement(nonColocatedIndex, ts1);
   }
 
   @Test
