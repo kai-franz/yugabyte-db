@@ -531,5 +531,74 @@ TEST_F(GeoTransactionsTest, YB_DISABLE_TEST_IN_TSAN(TestLeaderDistribution)) {
       "Timeout waiting for leaders to be evenly distributed"));
 }
 
+// Test that local -> global promotion works even after a table is moved using
+// ALTER TABLE SET TABLESPACE.
+// This test is similar to TestTransactionTabletSelection, except this time tables
+// are created in the local tablespace and then later distributed between tablespaces.
+TEST_F(GeoTransactionsTest, YB_DISABLE_TEST_IN_TSAN(TestPromotionAfterTablespaceChange)) {
+  constexpr int tables_per_region = 1;
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_create_local_transaction_tables) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_promote_nonlocal_transactions_to_global) = false;
+  SetupTablespaces();
+
+  // Create all tables in the local tablespace.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = true;
+  tables_per_region_ = tables_per_region;
+
+  auto conn = ASSERT_RESULT(Connect());
+
+  // Create all tables in the local tablespace.
+  for (size_t region_idx = 1; region_idx <= NumRegions(); ++region_idx) {
+    for (size_t table_idx = 1; table_idx <= tables_per_region; ++table_idx) {
+      ASSERT_OK(conn.ExecuteFormat(
+          "CREATE TABLE $0$1_$2(value int, other_value int) TABLESPACE tablespace$3",
+          kTablePrefix, region_idx, table_idx, kLocalRegion));
+    }
+  }
+
+  // Move tables to the "right" tablespace using ALTER TABLE SET TABLESPACE.
+  for (size_t region_idx = 1; region_idx <= NumRegions(); ++region_idx) {
+    for (size_t table_idx = 1; table_idx <= tables_per_region; ++table_idx) {
+      ASSERT_OK(conn.ExecuteFormat(
+          "ALTER TABLE $0$1_$2 SET TABLESPACE tablespace$1",
+          kTablePrefix, region_idx, table_idx, kLocalRegion));
+    }
+  }
+
+  CreateTransactionTable(kOtherRegion);
+  CreateTransactionTable(kLocalRegion);
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_promote_nonlocal_transactions_to_global) = true;
+
+  // Promotion now allowed. We do not check the status tablet for the promoted case in this test,
+  // because the transaction object we have access to here is from the original take request sent
+  // to the tserver, which is normally discarded and thus not kept up to date.
+  CheckSuccess(
+      kLocalRegion, SetGlobalTransactionsGFlag::kFalse, SetGlobalTransactionSessionVar::kFalse,
+      InsertToLocalFirst::kTrue, ExpectedLocality::kLocal);
+  CheckSuccess(
+      kOtherRegion, SetGlobalTransactionsGFlag::kFalse, SetGlobalTransactionSessionVar::kFalse,
+      InsertToLocalFirst::kTrue, ExpectedLocality::kNoCheck);
+  CheckSuccess(
+      kLocalRegion, SetGlobalTransactionsGFlag::kTrue, SetGlobalTransactionSessionVar::kFalse,
+      InsertToLocalFirst::kTrue, ExpectedLocality::kGlobal);
+  CheckSuccess(
+      kOtherRegion, SetGlobalTransactionsGFlag::kTrue, SetGlobalTransactionSessionVar::kFalse,
+      InsertToLocalFirst::kTrue, ExpectedLocality::kGlobal);
+  CheckSuccess(
+      kLocalRegion, SetGlobalTransactionsGFlag::kFalse, SetGlobalTransactionSessionVar::kTrue,
+      InsertToLocalFirst::kTrue, ExpectedLocality::kGlobal);
+  CheckSuccess(
+      kOtherRegion, SetGlobalTransactionsGFlag::kFalse, SetGlobalTransactionSessionVar::kTrue,
+      InsertToLocalFirst::kTrue, ExpectedLocality::kGlobal);
+  CheckSuccess(
+      kLocalRegion, SetGlobalTransactionsGFlag::kTrue, SetGlobalTransactionSessionVar::kTrue,
+      InsertToLocalFirst::kTrue, ExpectedLocality::kGlobal);
+  CheckSuccess(
+      kOtherRegion, SetGlobalTransactionsGFlag::kTrue, SetGlobalTransactionSessionVar::kTrue,
+      InsertToLocalFirst::kTrue, ExpectedLocality::kGlobal);
+}
+
 } // namespace client
 } // namespace yb
