@@ -283,7 +283,14 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     verifyDefaultPlacement(colocatedTableName);
     verifyCustomPlacement(nonColocatedTable);
 
-//     Test that ALTER ... SET TABLESPACE works on the non-colocated table/index.
+    // Wait for tablespace info to be refreshed in load balancer.
+    Thread.sleep(5 * MASTER_REFRESH_TABLESPACE_INFO_SECS);
+
+    // Verify that load balancer is indeed idle.
+    assertTrue(miniCluster.getClient().waitForLoadBalancerIdle(
+      MASTER_LOAD_BALANCER_WAIT_TIME_MS));
+
+    // Test that ALTER ... SET TABLESPACE works on the non-colocated table/index.
     String ts1Name = "testTablespaceOptOutColocation";
     PlacementBlock block1 = new PlacementBlock("cloud1", "region1", "zone1", 1);
     Tablespace ts1 = new Tablespace(ts1Name, 1, Collections.singletonList(block1));
@@ -296,6 +303,11 @@ public class TestTablespaceProperties extends BasePgSQLTest {
       stmt.execute(String.format("ALTER INDEX %s SET TABLESPACE %s",
         nonColocatedIndex, ts1Name));
     }
+
+    // Wait for load balancer to run.
+    Thread.sleep(5 * MASTER_REFRESH_TABLESPACE_INFO_SECS);
+    assertTrue(miniCluster.getClient().waitForLoadBalancerIdle(
+      MASTER_LOAD_BALANCER_WAIT_TIME_MS));
 
     verifyCustomPlacement(nonColocatedTable, ts1);
     verifyCustomPlacement(nonColocatedIndex, ts1);
@@ -1214,8 +1226,43 @@ public class TestTablespaceProperties extends BasePgSQLTest {
   }
 
   /**
-   * Tests ALTER TABLE SET TABLESPACE, ALTER INDEX SET TABLESPACE, and
-   * ALTER MATERIALIZED VIEW SET TABLESPACE running concurrently with a DML workload.
+   * Helper function for running DDL statements in a thread.
+   *
+   * @param conn              Connection to use for executing the statement.
+   * @param sql               SQL statement to execute, as a format string with a single %s to be
+   *                          replaced with the tablespace name.
+   * @param errorsDetected    AtomicBoolean to set if an error is detected.
+   * @param barrier           CyclicBarrier to synchronize with other threads.
+   * @param numStmtsPerThread Number of statements to execute per thread.
+   * @param tablespaces       Array of tablespaces to cycle through.
+   */
+  public void runDDLThread(Connection conn, String sql, AtomicBoolean errorsDetected,
+                           CyclicBarrier barrier, int numStmtsPerThread, Tablespace[] tablespaces)
+    throws InterruptedException, BrokenBarrierException {
+    try (Statement lstmt = conn.createStatement()) {
+      for (int i = 0; i < numStmtsPerThread; ++i) {
+        barrier.await();
+
+        final int tablespaceIdx = i % tablespaces.length;
+        String sqlStmt = String.format(sql, tablespaces[tablespaceIdx].name);
+
+        try {
+          LOG.info("DDL thread: Executing statement: " + sqlStmt);
+          lstmt.execute(sqlStmt);
+
+        } catch (Exception e) {
+          LOG.error(String.format("Unexpected exception while executing %s: %s", sqlStmt, e.getMessage()));
+          errorsDetected.set(true);
+        }
+      }
+    } catch (SQLException e) {
+      LOG.info("Infrastructure exception, can be ignored", e);
+    }
+  }
+
+
+  /**
+   * Tests ALTER TABLE SET TABLESPACE running concurrently with a DML workload.
    */
   @Test
   public void testAlterTableSetTablespaceConcurrent() throws Exception {
@@ -1252,17 +1299,14 @@ public class TestTablespaceProperties extends BasePgSQLTest {
 
     // Create the table + index.
     try (Statement stmt = connection.createStatement()) {
-      stmt.execute("CREATE TABLE concurrent_test_t " +
+      stmt.execute("CREATE TABLE concurrent_test_tbl " +
         "(k INT PRIMARY KEY, v1 INT DEFAULT 10, v2 INT DEFAULT 20)");
-      stmt.execute("CREATE INDEX t_idx ON concurrent_test_t(v1)");
-      stmt.execute("CREATE MATERIALIZED VIEW concurrent_test_mv AS " +
-        "SELECT COUNT(*) FROM concurrent_test_t");
     }
 
     // Number of DML threads to run concurrently.
     int numDmlThreads = 1;
     // Number of DDL threads to run concurrently.
-    int numDdlThreads = 3;
+    int numDdlThreads = 1;
     // Number of total threads.
     int totalThreads = numDmlThreads + numDdlThreads;
     // Number of statements to execute per thread.
@@ -1289,71 +1333,14 @@ public class TestTablespaceProperties extends BasePgSQLTest {
 
     // ALTER TABLE SET TABLESPACE thread.
     threads[0] = new Thread(() -> {
-      try (Statement lstmt = connections[0].createStatement()) {
-        for (int i = 0; i < numStmtsPerThread; ++i) {
-          final int tablespaceIdx = i % tablespaces.length;
-          barrier.await();
-          try {
-            LOG.info("Altering tablespace for table");
-            lstmt.execute("ALTER TABLE concurrent_test_t SET TABLESPACE " +
-              tablespaces[tablespaceIdx].name);
-          } catch (Exception e) {
-            LOG.error("Unexpected exception while executing ALTER TABLE SET TABLESPACE",
-              e.getMessage());
-            errorsDetected.set(true);
-          }
-        }
-      } catch (InterruptedException | BrokenBarrierException | SQLException throwables) {
-        LOG.info("Infrastructure exception, can be ignored", throwables);
-      } finally {
-        barrier.reset();
+      try {
+        runDDLThread(connections[0], "ALTER TABLE concurrent_test_tbl SET TABLESPACE %s",
+          errorsDetected, barrier, numStmtsPerThread, tablespaces);
+      } catch (InterruptedException | BrokenBarrierException e) {
+        LOG.info("Infrastructure exception, can be ignored", e);
       }
     });
 
-    // ALTER INDEX SET TABLESPACE thread.
-    threads[1] = new Thread(() -> {
-      try (Statement lstmt = connections[0].createStatement()) {
-        for (int i = 0; i < numStmtsPerThread; ++i) {
-          final int tablespaceIdx = i % tablespaces.length;
-          barrier.await();
-          try {
-            LOG.info("Altering tablespace for index");
-            lstmt.execute("ALTER INDEX t_idx SET TABLESPACE " + tablespaces[tablespaceIdx].name);
-          } catch (Exception e) {
-            LOG.error("Unexpected exception while executing ALTER INDEX SET TABLESPACE",
-              e.getMessage());
-            errorsDetected.set(true);
-          }
-        }
-      } catch (InterruptedException | BrokenBarrierException | SQLException throwables) {
-        LOG.info("Infrastructure exception, can be ignored", throwables);
-      } finally {
-        barrier.reset();
-      }
-    });
-
-    // ALTER MATERIALIZED VIEW SET TABLESPACE thread.
-    threads[2] = new Thread(() -> {
-      try (Statement lstmt = connections[0].createStatement()) {
-        for (int i = 0; i < numStmtsPerThread; ++i) {
-          final int tablespaceIdx = i % tablespaces.length;
-          barrier.await();
-          try {
-            LOG.info("Altering tablespace for materialized view");
-            lstmt.execute("ALTER MATERIALIZED VIEW concurrent_test_mv SET TABLESPACE " +
-              tablespaces[tablespaceIdx].name);
-          } catch (Exception e) {
-            LOG.error("Unexpected exception while executing ALTER MATERIALIZED VIEW SET TABLESPACE",
-              e.getMessage());
-            errorsDetected.set(true);
-          }
-        }
-      } catch (InterruptedException | BrokenBarrierException | SQLException throwables) {
-        LOG.info("Infrastructure exception, can be ignored", throwables);
-      } finally {
-        barrier.reset();
-      }
-    });
 
     // Enqueue the DML threads.
     for (int i = numDdlThreads; i < totalThreads; ++i) {
@@ -1366,12 +1353,12 @@ public class TestTablespaceProperties extends BasePgSQLTest {
             barrier.await();
             try {
               lstmt.execute(String.format(
-                "INSERT INTO concurrent_test_t(k, v1, v2) VALUES(%d, %d, %d)",
+                "INSERT INTO concurrent_test_tbl(k, v1, v2) VALUES(%d, %d, %d)",
                 idx * 10000000L + item_idx,
                 idx * 10000000L + item_idx + 1,
                 idx * 10000000L + item_idx + 2));
 
-              lstmt.execute(String.format("UPDATE concurrent_test_t SET v2 = v2 + 1 WHERE v1 = %d",
+              lstmt.execute(String.format("UPDATE concurrent_test_tbl SET v2 = v2 + 1 WHERE v1 = %d",
                 item_idx));
             } catch (Exception e) {
               final String msg = e.getMessage();
@@ -1394,6 +1381,7 @@ public class TestTablespaceProperties extends BasePgSQLTest {
 
     // Wait for join.
     Arrays.stream(threads).forEach(Thread::start);
+
     for (Thread t : threads) {
       t.join();
     }
@@ -1410,8 +1398,294 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     assertFalse(errorsDetected.get());
 
     // Verify that the table has the right number of rows and is placed in the expected tablespace
-    assertEquals(numDmlThreads * numStmtsPerThread, getNumRows("concurrent_test_t"));
-    verifyCustomPlacement("concurrent_test_t", expectedFinalTablespace);
+    assertEquals(numDmlThreads * numStmtsPerThread, getNumRows("concurrent_test_tbl"));
+    verifyCustomPlacement("concurrent_test_tbl", expectedFinalTablespace);
+  }
+
+  /**
+   * Tests ALTER INDEX SET TABLESPACE running concurrently with a DML workload.
+   */
+  @Test
+  public void testAlterIndexSetTablespaceConcurrent() throws Exception {
+    markClusterNeedsRecreation();
+    final YBClient client = miniCluster.getClient();
+    int previousBGWait = MiniYBCluster.CATALOG_MANAGER_BG_TASK_WAIT_MS;
+
+    for (HostAndPort hp : miniCluster.getMasters().keySet()) {
+      // Increase the interval between subsequent runs of bg thread so that
+      // it assigns replicas for tablets of both the tables concurrently.
+      assertTrue(client.setFlag(hp, "catalog_manager_bg_task_wait_ms", "10000"));
+      assertTrue(client.setFlag(hp,
+        "TEST_skip_placement_validation_createtable_api", "true", true));
+    }
+    LOG.info("Increased the delay between successive runs of bg threads.");
+
+    // Create three tablespaces with a single placement block each.
+    String ts1Name = "testTablespaceZone1";
+    PlacementBlock block1 = new PlacementBlock("cloud1", "region1", "zone1", 1);
+    Tablespace ts1 = new Tablespace(ts1Name, 1, Collections.singletonList(block1));
+    ts1.create();
+
+    String ts2Name = "testTablespaceZone2";
+    PlacementBlock block2 = new PlacementBlock("cloud2", "region2", "zone2", 1);
+    Tablespace ts2 = new Tablespace(ts2Name, 1, Collections.singletonList(block2));
+    ts2.create();
+
+    String ts3Name = "testTablespaceZone3";
+    PlacementBlock block3 = new PlacementBlock("cloud3", "region3", "zone3", 1);
+    Tablespace ts3 = new Tablespace(ts3Name, 1, Collections.singletonList(block3));
+    ts3.create();
+
+    Tablespace[] tablespaces = new Tablespace[]{ts1, ts2, ts3};
+
+    // Create the table + index.
+    try (Statement stmt = connection.createStatement()) {
+      stmt.execute("CREATE TABLE concurrent_test_tbl " +
+        "(k INT PRIMARY KEY, v1 INT DEFAULT 10, v2 INT DEFAULT 20)");
+      stmt.execute("CREATE INDEX concurrent_test_idx ON concurrent_test_tbl(v1)");
+    }
+
+    // Number of DML threads to run concurrently.
+    int numDmlThreads = 1;
+    // Number of DDL threads to run concurrently.
+    int numDdlThreads = 1;
+    // Number of total threads.
+    int totalThreads = numDmlThreads + numDdlThreads;
+    // Number of statements to execute per thread.
+    int numStmtsPerThread = 10;
+
+    // Synchronization variables.
+    final AtomicBoolean errorsDetected = new AtomicBoolean(false);
+    final CyclicBarrier barrier = new CyclicBarrier(totalThreads);
+    final Thread[] threads = new Thread[totalThreads];
+    final Connection[] connections = new Connection[totalThreads];
+
+    for (int i = 0; i < totalThreads; ++i) {
+      ConnectionBuilder b = getConnectionBuilder();
+      b.withTServer(totalThreads % miniCluster.getNumTServers());
+      connections[i] = b.connect();
+    }
+
+    // Enqueue threads that execute ALTER TABLESPACE commands on a table, index, and mat view.
+    // These threads cycle through the tablespaces in the tablespaces array round-robin.
+    // In total, each thread does numStmtsPerThread ALTER TABLESPACE commands.
+    // When these threads are done, we to be in tablespace number
+    // (numStmtsPerThread - 1) % tablespaces.length.
+    Tablespace expectedFinalTablespace = tablespaces[(numStmtsPerThread - 1) % tablespaces.length];
+
+    // ALTER INDEX SET TABLESPACE thread.
+    threads[0] = new Thread(() -> {
+      try {
+        runDDLThread(connections[0], "ALTER INDEX concurrent_test_idx SET TABLESPACE %s",
+          errorsDetected, barrier, numStmtsPerThread, tablespaces);
+      } catch (InterruptedException | BrokenBarrierException e) {
+        LOG.info("Infrastructure exception, can be ignored", e);
+      }
+    });
+
+    // Enqueue the DML threads.
+    for (int i = numDdlThreads; i < totalThreads; ++i) {
+      final int idx = i;
+      threads[i] = new Thread(() -> {
+        try (Statement lstmt = connections[idx].createStatement()) {
+          for (int item_idx = 0;
+               !errorsDetected.get() && item_idx < numStmtsPerThread;
+               ++item_idx) {
+            barrier.await();
+            try {
+              lstmt.execute(String.format(
+                "INSERT INTO concurrent_test_tbl(k, v1, v2) VALUES(%d, %d, %d)",
+                idx * 10000000L + item_idx,
+                idx * 10000000L + item_idx + 1,
+                idx * 10000000L + item_idx + 2));
+
+              lstmt.execute(String.format("UPDATE concurrent_test_tbl SET v2 = v2 + 1 WHERE v1 = %d",
+                item_idx));
+            } catch (Exception e) {
+              final String msg = e.getMessage();
+              if (!(msg.contains("Catalog Version Mismatch") ||
+                msg.contains("Restart read required") ||
+                msg.contains("schema version mismatch"))) {
+                LOG.error("Unexpected exception while executing INSERT/UPDATE", e);
+                errorsDetected.set(true);
+                return;
+              }
+            }
+          }
+        } catch (InterruptedException | BrokenBarrierException | SQLException throwables) {
+          LOG.info("Infrastructure exception, can be ignored", throwables);
+        } finally {
+          barrier.reset();
+        }
+      });
+    }
+
+    // Run threads and wait for join.
+    Arrays.stream(threads).forEach(Thread::start);
+
+    for (Thread t : threads) {
+      t.join();
+    }
+
+    // Reset the bg threads delay.
+    for (HostAndPort hp : miniCluster.getMasters().keySet()) {
+      assertTrue(client.setFlag(hp, "catalog_manager_bg_task_wait_ms",
+        Integer.toString(previousBGWait)));
+      assertTrue(client.setFlag(hp, "TEST_skip_placement_validation_createtable_api",
+        "false", true));
+    }
+
+    // Verify that no errors were thrown by the worker threads.
+    assertFalse(errorsDetected.get());
+
+    // Verify that the table has the right number of rows.
+    assertEquals(numDmlThreads * numStmtsPerThread, getNumRows("concurrent_test_tbl"));
+
+    // Verify that the index is placed according to the expected final tablespace.
+    verifyCustomPlacement("concurrent_test_idx", expectedFinalTablespace);
+    LOG.info("testAlterTableSetTablespaceConcurrent completed successfully");
+  }
+
+  /**
+   * Tests ALTER MATERIALIZED VIEW SET TABLESPACE running concurrently with a DML workload.
+   */
+  @Test
+  public void testAlterMatViewSetTablespaceConcurrent() throws Exception {
+    markClusterNeedsRecreation();
+    final YBClient client = miniCluster.getClient();
+    int previousBGWait = MiniYBCluster.CATALOG_MANAGER_BG_TASK_WAIT_MS;
+
+    for (HostAndPort hp : miniCluster.getMasters().keySet()) {
+      // Increase the interval between subsequent runs of bg thread so that
+      // it assigns replicas for tablets of both the tables concurrently.
+      assertTrue(client.setFlag(hp, "catalog_manager_bg_task_wait_ms", "10000"));
+      assertTrue(client.setFlag(hp,
+        "TEST_skip_placement_validation_createtable_api", "true", true));
+    }
+    LOG.info("Increased the delay between successive runs of bg threads.");
+
+    // Create three tablespaces with a single placement block each.
+    String ts1Name = "testTablespaceZone1";
+    PlacementBlock block1 = new PlacementBlock("cloud1", "region1", "zone1", 1);
+    Tablespace ts1 = new Tablespace(ts1Name, 1, Collections.singletonList(block1));
+    ts1.create();
+
+    String ts2Name = "testTablespaceZone2";
+    PlacementBlock block2 = new PlacementBlock("cloud2", "region2", "zone2", 1);
+    Tablespace ts2 = new Tablespace(ts2Name, 1, Collections.singletonList(block2));
+    ts2.create();
+
+    String ts3Name = "testTablespaceZone3";
+    PlacementBlock block3 = new PlacementBlock("cloud3", "region3", "zone3", 1);
+    Tablespace ts3 = new Tablespace(ts3Name, 1, Collections.singletonList(block3));
+    ts3.create();
+
+    Tablespace[] tablespaces = new Tablespace[]{ts1, ts2, ts3};
+
+    // Create the table + index.
+    try (Statement stmt = connection.createStatement()) {
+      stmt.execute("CREATE TABLE concurrent_test_tbl " +
+        "(k INT PRIMARY KEY, v1 INT DEFAULT 10, v2 INT DEFAULT 20)");
+      stmt.execute("CREATE MATERIALIZED VIEW concurrent_test_mv AS " +
+        "SELECT COUNT(*) FROM concurrent_test_tbl");
+    }
+
+    // Number of DML threads to run concurrently.
+    int numDmlThreads = 1;
+    // Number of DDL threads to run concurrently.
+    int numDdlThreads = 1;
+    // Number of total threads.
+    int totalThreads = numDmlThreads + numDdlThreads;
+    // Number of statements to execute per thread.
+    int numStmtsPerThread = 10;
+
+    // Synchronization variables.
+    final AtomicBoolean errorsDetected = new AtomicBoolean(false);
+    final CyclicBarrier barrier = new CyclicBarrier(totalThreads);
+    final Thread[] threads = new Thread[totalThreads];
+    final Connection[] connections = new Connection[totalThreads];
+
+    for (int i = 0; i < totalThreads; ++i) {
+      ConnectionBuilder b = getConnectionBuilder();
+      b.withTServer(totalThreads % miniCluster.getNumTServers());
+      connections[i] = b.connect();
+    }
+
+    // Enqueue threads that execute ALTER TABLESPACE commands on a table, index, and mat view.
+    // These threads cycle through the tablespaces in the tablespaces array round-robin.
+    // In total, each thread does numStmtsPerThread ALTER TABLESPACE commands.
+    // When these threads are done, we to be in tablespace number
+    // (numStmtsPerThread - 1) % tablespaces.length.
+    Tablespace expectedFinalTablespace = tablespaces[(numStmtsPerThread - 1) % tablespaces.length];
+
+    // ALTER TABLE SET TABLESPACE thread.
+    threads[0] = new Thread(() -> {
+      try {
+        runDDLThread(connections[0],
+          "ALTER MATERIALIZED VIEW concurrent_test_mv SET TABLESPACE %s",
+          errorsDetected, barrier, numStmtsPerThread, tablespaces);
+      } catch (InterruptedException | BrokenBarrierException e) {
+        LOG.info("Infrastructure exception, can be ignored", e);
+      }
+    });
+
+    // Enqueue the DML threads.
+    for (int i = numDdlThreads; i < totalThreads; ++i) {
+      final int idx = i;
+      threads[i] = new Thread(() -> {
+        try (Statement lstmt = connections[idx].createStatement()) {
+          for (int item_idx = 0;
+               !errorsDetected.get() && item_idx < numStmtsPerThread;
+               ++item_idx) {
+            barrier.await();
+            try {
+              lstmt.execute(String.format(
+                "INSERT INTO concurrent_test_tbl(k, v1, v2) VALUES(%d, %d, %d)",
+                idx * 10000000L + item_idx,
+                idx * 10000000L + item_idx + 1,
+                idx * 10000000L + item_idx + 2));
+
+              lstmt.execute(String.format("UPDATE concurrent_test_tbl SET v2 = v2 + 1 WHERE v1 = %d",
+                item_idx));
+            } catch (Exception e) {
+              final String msg = e.getMessage();
+              if (!(msg.contains("Catalog Version Mismatch") ||
+                msg.contains("Restart read required") ||
+                msg.contains("schema version mismatch"))) {
+                LOG.error("Unexpected exception while executing INSERT/UPDATE", e);
+                errorsDetected.set(true);
+                return;
+              }
+            }
+          }
+        } catch (InterruptedException | BrokenBarrierException | SQLException throwables) {
+          LOG.info("Infrastructure exception, can be ignored", throwables);
+        } finally {
+          barrier.reset();
+        }
+      });
+    }
+
+    // Run threads and wait for join.
+    Arrays.stream(threads).forEach(Thread::start);
+
+    for (Thread t : threads) {
+      t.join();
+    }
+
+    // Reset the bg threads delay.
+    for (HostAndPort hp : miniCluster.getMasters().keySet()) {
+      assertTrue(client.setFlag(hp, "catalog_manager_bg_task_wait_ms",
+        Integer.toString(previousBGWait)));
+      assertTrue(client.setFlag(hp, "TEST_skip_placement_validation_createtable_api",
+        "false", true));
+    }
+
+    // Verify that no errors were thrown by the worker threads.
+    assertFalse(errorsDetected.get());
+
+    // Verify that the table has the right number of rows
+    assertEquals(numDmlThreads * numStmtsPerThread, getNumRows("concurrent_test_tbl"));
 
     // Verify that the materialized view has the right contents
     // and is placed in the expected tablespace
@@ -1420,9 +1694,6 @@ public class TestTablespaceProperties extends BasePgSQLTest {
       assertEquals(0, (long) row.getLong(0));
     }
     verifyCustomPlacement("concurrent_test_mv", expectedFinalTablespace);
-
-    // Verify that the index is placed according to the expected final tablespace.
-    verifyCustomPlacement("t_idx", expectedFinalTablespace);
   }
 
   /**
