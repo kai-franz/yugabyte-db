@@ -5559,7 +5559,8 @@ RelationCacheInitializePhase3(void)
 		 * again and re-compute needNewCacheFile.
 		 */
 		Assert(OidIsValid(MyDatabaseId));
-		needNewCacheFile = !load_relcache_init_file(true);
+		needNewCacheFile = !load_relcache_init_file(true) && 
+			!*YBCGetGFlags()->ysql_catalog_preload_additional_tables;
 	}
 
 	/*
@@ -5598,9 +5599,10 @@ RelationCacheInitializePhase3(void)
 	{
 		Assert(!YBCIsSysTablePrefetchingStarted());
 
-		bool preload_rel_cache =
-			needNewCacheFile ||
-			YBCIsInitDbModeEnvVarSet();
+        bool preload_rel_cache =
+            needNewCacheFile ||
+            YBCIsInitDbModeEnvVarSet() ||
+            *YBCGetGFlags()->ysql_catalog_preload_additional_tables;
 		YbPrefetchRequiredData(preload_rel_cache);
 
 		Assert(YBCIsSysTablePrefetchingStarted());
