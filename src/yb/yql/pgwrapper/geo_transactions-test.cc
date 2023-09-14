@@ -539,16 +539,15 @@ TEST_F(GeoTransactionsTest, YB_DISABLE_TEST_IN_TSAN(TestPromotionAfterTablespace
   constexpr int tables_per_region = 1;
 
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_create_local_transaction_tables) = false;
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_promote_nonlocal_transactions_to_global) = false;
-  SetupTablespaces();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_promote_nonlocal_transactions_to_global) = true;
 
   // Create all tables in the local tablespace.
+  SetupTablespaces();
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = true;
   tables_per_region_ = tables_per_region;
 
-  auto conn = ASSERT_RESULT(Connect());
-
   // Create all tables in the local tablespace.
+  auto conn = ASSERT_RESULT(Connect());
   for (size_t region_idx = 1; region_idx <= NumRegions(); ++region_idx) {
     for (size_t table_idx = 1; table_idx <= tables_per_region; ++table_idx) {
       ASSERT_OK(conn.ExecuteFormat(
@@ -568,8 +567,6 @@ TEST_F(GeoTransactionsTest, YB_DISABLE_TEST_IN_TSAN(TestPromotionAfterTablespace
 
   CreateTransactionTable(kOtherRegion);
   CreateTransactionTable(kLocalRegion);
-
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_promote_nonlocal_transactions_to_global) = true;
 
   // Promotion now allowed. We do not check the status tablet for the promoted case in this test,
   // because the transaction object we have access to here is from the original take request sent
@@ -598,6 +595,31 @@ TEST_F(GeoTransactionsTest, YB_DISABLE_TEST_IN_TSAN(TestPromotionAfterTablespace
   CheckSuccess(
       kOtherRegion, SetGlobalTransactionsGFlag::kTrue, SetGlobalTransactionSessionVar::kTrue,
       InsertToLocalFirst::kTrue, ExpectedLocality::kGlobal);
+}
+
+
+TEST_F(GeoTransactionsTest, YB_DISABLE_TEST_IN_TSAN(TestAlterTableSetTablespaceMidTxn)) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_create_local_transaction_tables) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_promote_nonlocal_transactions_to_global) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = false;
+
+  constexpr int tables_per_region = 1;
+  SetupTablesAndTablespaces(tables_per_region);
+  auto conn1 = ASSERT_RESULT(Connect());
+  auto conn2 = ASSERT_RESULT(Connect());
+
+  // Start a transaction on a local table.
+  ASSERT_OK(conn1.ExecuteFormat("SET force_global_transaction = $0", ToString(SetGlobalTransactionSessionVar::kTrue)));
+  ASSERT_OK(conn1.StartTransaction(IsolationLevel::SERIALIZABLE_ISOLATION));
+  ASSERT_OK(conn1.ExecuteFormat(
+      "INSERT INTO $0$1_1(value) VALUES (0)", kTablePrefix, kLocalRegion));
+  ASSERT_OK(conn1.ExecuteFormat("INSERT INTO $0$1_1(value) VALUES (0)", kTablePrefix, kLocalRegion));
+
+  // Move the table to a different region.
+  ASSERT_OK(conn2.ExecuteFormat("ALTER TABLE $0$1_1 SET TABLESPACE tablespace$2", kTablePrefix, kLocalRegion, kOtherRegion));
+
+  // The transaction should fail cleanly with a "Catalog Version Mismatch" error.
+  ASSERT_NOT_OK(conn1.CommitTransaction());
 }
 
 } // namespace client
