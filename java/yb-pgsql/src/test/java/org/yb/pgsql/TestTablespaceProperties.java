@@ -1260,6 +1260,30 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     }
   }
 
+  /**
+   * Generates several tablespaces with varying placement and replication.
+   * @return Array of generated tablespaces.
+   */
+  public Tablespace[] generateTestTablespaces() {
+    PlacementBlock block1 = new PlacementBlock("cloud1", "region1", "zone1", 1);
+    PlacementBlock block2 = new PlacementBlock("cloud2", "region2", "zone2", 1);
+    PlacementBlock block3 = new PlacementBlock("cloud3", "region3", "zone3", 1);
+
+    // Single-node tablespaces
+    Tablespace ts1 = new Tablespace("testTsZone1", 1, Collections.singletonList(block1));
+    Tablespace ts2 = new Tablespace("testTsZone2", 1, Collections.singletonList(block2));
+    Tablespace ts3 = new Tablespace("testTsZone3", 1, Collections.singletonList(block3));
+
+    // Double-node tablespaces
+    Tablespace ts12 = new Tablespace("testTsZone12", 2, Arrays.asList(block1, block2));
+    Tablespace ts23 = new Tablespace("testTsZone23", 2, Arrays.asList(block2, block3));
+    Tablespace ts13 = new Tablespace("testTsZone13", 2, Arrays.asList(block1, block3));
+
+    // Triple-node tablespace
+    Tablespace ts123 = new Tablespace("testTsZone123", 3, Arrays.asList(block1, block2, block3));
+
+    return new Tablespace[]{ts1, ts2, ts3, ts12, ts23, ts13, ts123};
+  }
 
   /**
    * Tests ALTER TABLE SET TABLESPACE running concurrently with a DML workload.
@@ -1279,23 +1303,9 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     }
     LOG.info("Increased the delay between successive runs of bg threads.");
 
-    // Create three tablespaces with a single placement block each.
-    String ts1Name = "testTablespaceZone1";
-    PlacementBlock block1 = new PlacementBlock("cloud1", "region1", "zone1", 1);
-    Tablespace ts1 = new Tablespace(ts1Name, 1, Collections.singletonList(block1));
-    ts1.create();
-
-    String ts2Name = "testTablespaceZone2";
-    PlacementBlock block2 = new PlacementBlock("cloud2", "region2", "zone2", 1);
-    Tablespace ts2 = new Tablespace(ts2Name, 1, Collections.singletonList(block2));
-    ts2.create();
-
-    String ts3Name = "testTablespaceZone3";
-    PlacementBlock block3 = new PlacementBlock("cloud3", "region3", "zone3", 1);
-    Tablespace ts3 = new Tablespace(ts3Name, 1, Collections.singletonList(block3));
-    ts3.create();
-
-    Tablespace[] tablespaces = new Tablespace[]{ts1, ts2, ts3};
+    // Create some tablespaces with varying placement and replication.
+    Tablespace[] tablespaces = generateTestTablespaces();
+    Arrays.stream(tablespaces).forEach(Tablespace::create);
 
     // Create the table + index.
     try (Statement stmt = connection.createStatement()) {
@@ -1420,23 +1430,9 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     }
     LOG.info("Increased the delay between successive runs of bg threads.");
 
-    // Create three tablespaces with a single placement block each.
-    String ts1Name = "testTablespaceZone1";
-    PlacementBlock block1 = new PlacementBlock("cloud1", "region1", "zone1", 1);
-    Tablespace ts1 = new Tablespace(ts1Name, 1, Collections.singletonList(block1));
-    ts1.create();
-
-    String ts2Name = "testTablespaceZone2";
-    PlacementBlock block2 = new PlacementBlock("cloud2", "region2", "zone2", 1);
-    Tablespace ts2 = new Tablespace(ts2Name, 1, Collections.singletonList(block2));
-    ts2.create();
-
-    String ts3Name = "testTablespaceZone3";
-    PlacementBlock block3 = new PlacementBlock("cloud3", "region3", "zone3", 1);
-    Tablespace ts3 = new Tablespace(ts3Name, 1, Collections.singletonList(block3));
-    ts3.create();
-
-    Tablespace[] tablespaces = new Tablespace[]{ts1, ts2, ts3};
+    // Create some tablespaces with varying placement and replication.
+    Tablespace[] tablespaces = generateTestTablespaces();
+    Arrays.stream(tablespaces).forEach(Tablespace::create);
 
     // Create the table + index.
     try (Statement stmt = connection.createStatement()) {
@@ -1564,23 +1560,9 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     }
     LOG.info("Increased the delay between successive runs of bg threads.");
 
-    // Create three tablespaces with a single placement block each.
-    String ts1Name = "testTablespaceZone1";
-    PlacementBlock block1 = new PlacementBlock("cloud1", "region1", "zone1", 1);
-    Tablespace ts1 = new Tablespace(ts1Name, 1, Collections.singletonList(block1));
-    ts1.create();
-
-    String ts2Name = "testTablespaceZone2";
-    PlacementBlock block2 = new PlacementBlock("cloud2", "region2", "zone2", 1);
-    Tablespace ts2 = new Tablespace(ts2Name, 1, Collections.singletonList(block2));
-    ts2.create();
-
-    String ts3Name = "testTablespaceZone3";
-    PlacementBlock block3 = new PlacementBlock("cloud3", "region3", "zone3", 1);
-    Tablespace ts3 = new Tablespace(ts3Name, 1, Collections.singletonList(block3));
-    ts3.create();
-
-    Tablespace[] tablespaces = new Tablespace[]{ts1, ts2, ts3};
+    // Create some tablespaces with varying placement and replication.
+    Tablespace[] tablespaces = generateTestTablespaces();
+    Arrays.stream(tablespaces).forEach(Tablespace::create);
 
     // Create the table + index.
     try (Statement stmt = connection.createStatement()) {
@@ -1776,9 +1758,12 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     /**
      * Executes the command to create this tablespace.
      */
-    public void create() throws Exception {
+    public void create() {
       try (Statement setupStatement = connection.createStatement()) {
         setupStatement.execute(this.getCreateCmd());
+      } catch (SQLException e) {
+        LOG.error("Unexpected exception while creating tablespace: ", e);
+        fail("Unexpected exception while creating tablespace");
       }
     }
   }
