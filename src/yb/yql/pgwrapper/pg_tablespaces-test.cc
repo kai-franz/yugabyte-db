@@ -213,6 +213,7 @@ public:
       std::vector<CloudInfoPB> replica_cloud_infos;
       for (const auto& replica : tablet.replicas()) {
         replica_cloud_infos.push_back(replica.ts_info().cloud_info());
+        LOG(INFO) << "Replica: " << replica.ts_info().cloud_info().DebugString();
       }
 
       for (const auto& placement_block : placement_blocks) {
@@ -552,6 +553,183 @@ TEST_F(PgTablespacesTest, YB_DISABLE_TEST_IN_TSAN(TestAlterMatViewMajority)) {
 
   // Verify that there are replicas in the two valid placement blocks.
   VerifyMinNumReplicas(mv_name, valid_majority_placement_blocks);
+}
+
+// Tests the following:
+// 1. Create a table.
+// 2. ALTER TABLE SET TABLESPACE to a tablespace.
+// 3. Remove a node that is in the tablespace. Verify the placement still holds.
+// 4. Add the node back. Verify the placement still holds.
+TEST_F(PgTablespacesTest, YB_DISABLE_TEST_IN_TSAN(TestAlterTableScaling)) {
+  // TODO(kai): The following code is copied. Change it.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_create_local_transaction_tables) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_tables_use_preferred_zones) = true;
+
+  // Create tablespaces and tables.
+  auto conn = ASSERT_RESULT(Connect());
+  string table_name = kTablePrefix;
+
+  // Create a tablespace with all the placement blocks available.
+  std::vector<PlacementBlock> placement_blocks;
+  for (size_t region_id = 1; region_id <= NumRegions(); ++region_id) {
+    // For simplicity, set the leader preference to be the same as the region ID.
+    size_t leader_preference = region_id;
+    placement_blocks.emplace_back(region_id, /* minNumReplicas = */ 1, leader_preference);
+  }
+  const size_t total_num_replicas = NumTabletServers();
+  Tablespace ts("ts", total_num_replicas, placement_blocks);
+
+  ASSERT_OK(conn.Execute(ts.getCreateCmd()));
+
+  // Create a table in the valid tablespace.
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0(value int) TABLESPACE ts", table_name));
+
+  WaitForLoadBalanceCompletion();
+
+  // Verify that the replicas for the table are distributed in ts.
+  VerifyMinNumReplicas(table_name, placement_blocks);
+
+  // Remove the node in the last region.
+  int shutdown_region = static_cast<int>(NumRegions());
+  LOG(INFO) << "Test: Shutting down tablet servers in region " << shutdown_region;
+  ASSERT_OK(ShutdownTabletServersByRegion(shutdown_region));
+
+  // The remaining placement blocks should be the same as the original, except for the last one.
+  std::vector<PlacementBlock> remaining_placement_blocks(
+    placement_blocks.begin(), 
+    placement_blocks.end() - 1
+  );
+
+  VerifyMinNumReplicas(table_name, remaining_placement_blocks);
+
+  // Add the node back.
+  LOG(INFO) << "Test: Starting tablet servers in region " << shutdown_region;
+  ASSERT_OK(StartTabletServersByRegion(shutdown_region));
+
+  WaitForLoadBalanceCompletion();
+
+  VerifyMinNumReplicas(table_name, placement_blocks);
+}
+
+// Tests the following:
+// 1. Create a table and an index.
+// 2. ALTER INDEX SET TABLESPACE to a tablespace.
+// 3. Remove a node that is in the tablespace. Verify the placement still holds.
+// 4. Add the node back. Verify the placement still holds.
+TEST_F(PgTablespacesTest, YB_DISABLE_TEST_IN_TSAN(TestAlterIndexScaling)) {
+  // TODO(kai): The following code is copied. Change it.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_create_local_transaction_tables) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_tables_use_preferred_zones) = true;
+
+  // Create tablespaces and tables.
+  auto conn = ASSERT_RESULT(Connect());
+  string table_name = kTablePrefix;
+  string index_name = table_name + "_idx";
+
+  // Create a tablespace with all the placement blocks available.
+  std::vector<PlacementBlock> placement_blocks;
+  for (size_t region_id = 1; region_id <= NumRegions(); ++region_id) {
+    // For simplicity, set the leader preference to be the same as the region ID.
+    size_t leader_preference = region_id;
+    placement_blocks.emplace_back(region_id, /* minNumReplicas = */ 1, leader_preference);
+  }
+  const size_t total_num_replicas = NumTabletServers();
+  Tablespace ts("ts", total_num_replicas, placement_blocks);
+
+  ASSERT_OK(conn.Execute(ts.getCreateCmd()));
+
+  // Create a table in the valid tablespace.
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0(value int) TABLESPACE ts", table_name));
+  // Create an index on the table.
+  ASSERT_OK(conn.ExecuteFormat("CREATE INDEX $0 ON $1(value) TABLESPACE ts", index_name, table_name));
+
+  WaitForLoadBalanceCompletion();
+
+  // Verify that the replicas for the index are distributed in ts.
+  VerifyMinNumReplicas(index_name, placement_blocks);
+
+  // Remove the node in the last region.
+  int shutdown_region = static_cast<int>(NumRegions());
+  LOG(INFO) << "Test: Shutting down tablet servers in region " << shutdown_region;
+  ASSERT_OK(ShutdownTabletServersByRegion(shutdown_region));
+
+  // The remaining placement blocks should be the same as the original, except for the last one.
+  std::vector<PlacementBlock> remaining_placement_blocks(
+    placement_blocks.begin(), 
+    placement_blocks.end() - 1
+  );
+
+  VerifyMinNumReplicas(index_name, remaining_placement_blocks);
+
+  // Add the node back.
+  LOG(INFO) << "Test: Starting tablet servers in region " << shutdown_region;
+  ASSERT_OK(StartTabletServersByRegion(shutdown_region));
+
+  WaitForLoadBalanceCompletion();
+
+  VerifyMinNumReplicas(index_name, placement_blocks);
+}
+
+// Tests the following:
+// 1. Create a table and a materialized view.
+// 2. ALTER MATERIALIZED VIEW SET TABLESPACE to a tablespace.
+// 3. Remove a node that is in the tablespace. Verify the placement still holds.
+// 4. Add the node back. Verify the placement still holds.
+TEST_F(PgTablespacesTest, YB_DISABLE_TEST_IN_TSAN(TestAlterMatViewScaling)) {
+  // TODO(kai): The following code is copied. Change it.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_create_local_transaction_tables) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_tables_use_preferred_zones) = true;
+
+  // Create tablespaces and tables.
+  auto conn = ASSERT_RESULT(Connect());
+  string table_name = kTablePrefix;
+  string mv_name = table_name + "_mv";
+
+  // Create a tablespace with all the placement blocks available.
+  std::vector<PlacementBlock> placement_blocks;
+  for (size_t region_id = 1; region_id <= NumRegions(); ++region_id) {
+    // For simplicity, set the leader preference to be the same as the region ID.
+    size_t leader_preference = region_id;
+    placement_blocks.emplace_back(region_id, /* minNumReplicas = */ 1, leader_preference);
+  }
+  const size_t total_num_replicas = NumTabletServers();
+  Tablespace ts("ts", total_num_replicas, placement_blocks);
+
+  ASSERT_OK(conn.Execute(ts.getCreateCmd()));
+
+  // Create a table in the valid tablespace.
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0(value int) TABLESPACE ts", table_name));
+  // Create a materialized view on the table.
+  ASSERT_OK(conn.ExecuteFormat("CREATE MATERIALIZED VIEW $0 AS SELECT * FROM $1 TABLESPACE ts", mv_name, table_name));
+
+  WaitForLoadBalanceCompletion();
+
+  // Verify that the replicas for the materialized view are distributed in ts.
+  VerifyMinNumReplicas(mv_name, placement_blocks);
+
+  // Remove the node in the last region.
+  int shutdown_region = static_cast<int>(NumRegions());
+  LOG(INFO) << "Test: Shutting down tablet servers in region " << shutdown_region;
+  ASSERT_OK(ShutdownTabletServersByRegion(shutdown_region));
+
+  // The remaining placement blocks should be the same as the original, except for the last one.
+  std::vector<PlacementBlock> remaining_placement_blocks(
+    placement_blocks.begin(), 
+    placement_blocks.end() - 1
+  );
+
+  VerifyMinNumReplicas(mv_name, remaining_placement_blocks);
+
+  // Add the node back.
+  LOG(INFO) << "Test: Starting tablet servers in region " << shutdown_region;
+  ASSERT_OK(StartTabletServersByRegion(shutdown_region));
+
+  WaitForLoadBalanceCompletion();
+
+  VerifyMinNumReplicas(mv_name, placement_blocks);
 }
 
 } // namespace client
