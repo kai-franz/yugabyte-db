@@ -5560,7 +5560,8 @@ RelationCacheInitializePhase3(void)
 		 */
 		Assert(OidIsValid(MyDatabaseId));
 		needNewCacheFile = !load_relcache_init_file(true) && 
-			!*YBCGetGFlags()->ysql_catalog_preload_additional_tables;
+			!*YBCGetGFlags()->ysql_catalog_preload_additional_tables &&
+			!IS_NON_EMPTY_STR_FLAG(YBCGetGFlags()->ysql_catalog_preload_additional_table_list);
 	}
 
 	/*
@@ -5602,7 +5603,9 @@ RelationCacheInitializePhase3(void)
         bool preload_rel_cache =
             needNewCacheFile ||
             YBCIsInitDbModeEnvVarSet() ||
-            *YBCGetGFlags()->ysql_catalog_preload_additional_tables;
+            *YBCGetGFlags()->ysql_catalog_preload_additional_tables ||
+			IS_NON_EMPTY_STR_FLAG(YBCGetGFlags()->ysql_catalog_preload_additional_table_list);
+
 		YbPrefetchRequiredData(preload_rel_cache);
 
 		Assert(YBCIsSysTablePrefetchingStarted());
