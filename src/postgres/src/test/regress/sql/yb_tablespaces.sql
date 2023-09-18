@@ -149,6 +149,11 @@ CREATE TEMPORARY TABLE temptest (a INT) TABLESPACE regress_tblspace;
 CREATE TEMPORARY TABLE temptest (a INT);
 -- Fail, cannot set tablespaces for temp tables
 ALTER TABLE temptest SET TABLESPACE regress_tblspace;
+-- Fail, cannot set tablespace for temp indexes
+CREATE INDEX temp_idx_tblspc ON temptest(a) TABLESPACE regress_tblspace;
+CREATE INDEX temp_idx ON temptest(a);
+-- Fail, cannot set tablespaces for temp tables
+ALTER INDEX temp_idx SET TABLESPACE regress_tblspace;
 DROP TABLE temptest;
 
 -- Fail, cannot set tablespaces for temp tables
@@ -397,7 +402,7 @@ CREATE TABLESPACE zone_pref
     {"cloud":"cloud1","region":"region2","zone":"zone1","min_num_replicas":1},
     {"cloud":"cloud2","region":"region2","zone":"zone2","min_num_replicas":1}]}');
 
-CREATE TABLESPACE region_pref 
+CREATE TABLESPACE region_pref
   WITH (replica_placement='{"num_replicas": 4, "placement_blocks": [
     {"cloud":"cloud1","region":"region1","zone":"zone1","min_num_replicas":1},
     {"cloud":"cloud1","region":"region1","zone":"zone2","min_num_replicas":1,"leader_preference":1},
