@@ -5560,8 +5560,7 @@ RelationCacheInitializePhase3(void)
 		 */
 		Assert(OidIsValid(MyDatabaseId));
 		needNewCacheFile = !load_relcache_init_file(true) && 
-			!*YBCGetGFlags()->ysql_catalog_preload_additional_tables &&
-			!IS_NON_EMPTY_STR_FLAG(YBCGetGFlags()->ysql_catalog_preload_additional_table_list) &&
+			!YbNeedAdditionalCatalogTables() &&
 			*YBCGetGFlags()->ysql_use_relcache_file;
 	}
 
@@ -5604,8 +5603,7 @@ RelationCacheInitializePhase3(void)
 		bool preload_rel_cache =
 			needNewCacheFile || 
 			YBCIsInitDbModeEnvVarSet() ||
-			*YBCGetGFlags()->ysql_catalog_preload_additional_tables ||
-			IS_NON_EMPTY_STR_FLAG(YBCGetGFlags()->ysql_catalog_preload_additional_table_list) ||
+			YbNeedAdditionalCatalogTables() ||
 			!*YBCGetGFlags()->ysql_use_relcache_file;
 
 		YbPrefetchRequiredData(preload_rel_cache);
@@ -7488,9 +7486,7 @@ load_relcache_init_file(bool shared)
 	 * below.
 	 */
 	if (IsYugaByteEnabled() &&
-		(IS_NON_EMPTY_STR_FLAG(
-			YBCGetGFlags()->ysql_catalog_preload_additional_table_list) ||
-			*YBCGetGFlags()->ysql_catalog_preload_additional_tables ||
+		(YbNeedAdditionalCatalogTables() || 
 			!*YBCGetGFlags()->ysql_use_relcache_file))
 		return false;
 
