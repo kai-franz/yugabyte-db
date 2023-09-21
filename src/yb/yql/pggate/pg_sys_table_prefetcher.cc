@@ -48,6 +48,7 @@
 #include "yb/yql/pggate/util/ybc_util.h"
 
 DEFINE_RUNTIME_bool(ysql_enable_read_request_caching, false, "Enable read request caching");
+DEFINE_RUNTIME_bool(ysql_use_relcache_file, true, "Use relcache init file");
 DEFINE_NON_RUNTIME_uint32(
     pg_cache_response_renew_soft_lifetime_limit_ms, 3 * 60 * 1000,
     "Lifetime limit for response cache soft renewing process");
