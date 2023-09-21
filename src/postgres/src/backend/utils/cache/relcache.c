@@ -2627,35 +2627,32 @@ YbUpdateRelationCacheImpl(YbUpdateRelationCacheState *state,
 
 	YbTablePrefetcherState *prefetcher = &ctx->prefetcher;
 
-	if (!ctx->is_using_response_cache)
+	/*
+	 * Preload other tables on demand.
+	 * This is the optimization to prevent master node from being overloaded
+	 * with lots of fat read requests (request which reads too much tables)
+	 * in case there are lots of opened connections.
+	 * Some of our tests has such setup. Reading all the tables in one
+	 * request on a debug build under heavy load may spend up to 5-6 secs.
+	 */
+	if (state->has_relations_with_trigger)
+		YbRegisterTable(prefetcher, YB_PFETCH_TABLE_PG_TRIGGER);
+
+	if (state->has_relations_with_row_security)
+		YbRegisterTable(prefetcher, YB_PFETCH_TABLE_PG_POLICY);
+
+	if (state->has_partitioned_tables)
 	{
-		/*
-		 * In case of disabled respose cache preload other tables on demand.
-		 * This is the optimization to prevent master node from being overloaded
-		 * with lots of fat read requests (request which reads too much tables)
-		 * in case there are lots of opened connections.
-		 * Some of our tests has such setup. Reading all the tables in one
-		 * request on a debug build under heavy load may spend up to 5-6 secs.
-		 */
-		if (state->has_relations_with_trigger)
-			YbRegisterTable(prefetcher, YB_PFETCH_TABLE_PG_TRIGGER);
-
-		if (state->has_relations_with_row_security)
-			YbRegisterTable(prefetcher, YB_PFETCH_TABLE_PG_POLICY);
-
-		if (state->has_partitioned_tables)
-		{
-			static const YbPFetchTable tables[] = {
-				YB_PFETCH_TABLE_PG_CAST,
-				YB_PFETCH_TABLE_PG_INHERITS,
-				YB_PFETCH_TABLE_PG_PROC};
-			YbRegisterTables(prefetcher, tables, lengthof(tables));
-		}
-
-		YBCStatus status = YbPrefetch(prefetcher);
-		if (status)
-			return status;
+		static const YbPFetchTable tables[] = {
+			YB_PFETCH_TABLE_PG_CAST,
+			YB_PFETCH_TABLE_PG_INHERITS,
+			YB_PFETCH_TABLE_PG_PROC};
+		YbRegisterTables(prefetcher, tables, lengthof(tables));
 	}
+
+	YBCStatus status = YbPrefetch(prefetcher);
+	if (status)
+		return status;
 
 	YBUpdateRelationsAttributes(state);
 
