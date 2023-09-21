@@ -495,11 +495,6 @@ class PgSysTablePrefetcher::Impl {
     std::sort(registered_for_loading_.begin(),
               registered_for_loading_.end(),
               [](const auto& lhs, const auto& rhs) { return lhs.table_id < rhs.table_id; });
-    // Log how many tables are being prefetched, and their names.
-    LOG(INFO) << "Prefetching " << registered_for_loading_.size() << " tables: "
-            << CollectionToString(registered_for_loading_, [](const auto& item) {
-                 return item.table_id;
-               });
     Loader loader(session, arena_, registered_for_loading_.size(), options_);
     PgObjectId prev_table_id;
     for (const auto& item : registered_for_loading_) {
