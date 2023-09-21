@@ -2238,7 +2238,7 @@ typedef enum YbPFetchTable
 	YB_PFETCH_TABLE_PG_TABLESPACE,
 	YB_PFETCH_TABLE_PG_TRIGGER,
 	YB_PFETCH_TABLE_PG_TYPE,
-	YB_PFETCH_TABLE_YB_PG_PROFILIE,
+	YB_PFETCH_TABLE_YB_PG_PROFILE,
 	YB_PFETCH_TABLE_YB_PG_ROLE_PROFILE,
 
 	YB_PFETCH_TABLE_LAST
@@ -2294,7 +2294,7 @@ static const YbCatNamePfId YbCatalogNamesPfIds[] = {
 	{"pg_tablespace", YB_PFETCH_TABLE_PG_TABLESPACE},
 	{"pg_trigger", YB_PFETCH_TABLE_PG_TRIGGER},
 	{"pg_type", YB_PFETCH_TABLE_PG_TYPE},
-	{"pg_yb_profile", YB_PFETCH_TABLE_YB_PG_PROFILIE},
+	{"pg_yb_profile", YB_PFETCH_TABLE_YB_PG_PROFILE},
 	{"pg_yb_role_profile", YB_PFETCH_TABLE_YB_PG_ROLE_PROFILE},
 };
 
@@ -2404,7 +2404,7 @@ YbGetPrefetchableTableInfoImpl(YbPFetchTable table)
 	case YB_PFETCH_TABLE_PG_TYPE:
 		return (YbPFetchTableInfo)
 			{ TypeRelationId, TYPEOID, TYPENAMENSP };
-	case YB_PFETCH_TABLE_YB_PG_PROFILIE:
+	case YB_PFETCH_TABLE_YB_PG_PROFILE:
 		return (YbPFetchTableInfo)
 			{ YbProfileRelationId, YB_INVALID_CACHE_ID, YB_INVALID_CACHE_ID };
 	case YB_PFETCH_TABLE_YB_PG_ROLE_PROFILE:
@@ -2837,7 +2837,7 @@ YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
 	if (*YBCGetGFlags()->ysql_enable_profile && YbLoginProfileCatalogsExist)
 	{
 		static const YbPFetchTable tables[] = {
-			YB_PFETCH_TABLE_YB_PG_PROFILIE,
+			YB_PFETCH_TABLE_YB_PG_PROFILE,
 			YB_PFETCH_TABLE_YB_PG_ROLE_PROFILE,
 			YB_PFETCH_TABLE_PG_CAST
 		};
