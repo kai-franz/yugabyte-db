@@ -45,6 +45,7 @@ METRIC_DECLARE_counter(pg_response_cache_entries_removed_by_gc);
 DECLARE_bool(ysql_enable_read_request_caching);
 DECLARE_bool(ysql_minimal_catalog_caches_preload);
 DECLARE_bool(ysql_catalog_preload_additional_tables);
+DECLARE_bool(ysql_use_relcache_file);
 DECLARE_string(ysql_catalog_preload_additional_table_list);
 DECLARE_uint64(TEST_pg_response_cache_catalog_read_time_usec);
 DECLARE_uint64(TEST_committed_history_cutoff_initial_value_usec);
@@ -76,6 +77,14 @@ class Configuration {
         preload_additional_catalog_list_(preload_catalog_list),
         preload_additional_catalog_tables_(preload_catalog_tables) {}
 
+  constexpr Configuration(
+      bool minimal_catalog_caches_preload, const std::string& preload_catalog_list, 
+      bool preload_catalog_tables, bool use_relcache_file)
+      : minimal_catalog_caches_preload_(minimal_catalog_caches_preload),
+        preload_additional_catalog_list_(preload_catalog_list),
+        preload_additional_catalog_tables_(preload_catalog_tables),
+        use_relcache_file_(use_relcache_file) {}
+
   bool minimal_catalog_caches_preload() const { return minimal_catalog_caches_preload_; }
   bool enable_read_request_caching() const { return response_cache_size_bytes_.has_value(); }
   std::optional<uint64_t> response_cache_size_bytes() const { return response_cache_size_bytes_; }
@@ -83,12 +92,14 @@ class Configuration {
     return preload_additional_catalog_list_;
   }
   bool preload_additional_catalog_tables() const { return preload_additional_catalog_tables_; }
+  bool use_relcache_file() const { return use_relcache_file_; }
 
  private:
   bool minimal_catalog_caches_preload_;
   std::optional<uint64_t> response_cache_size_bytes_;
   std::optional<std::string> preload_additional_catalog_list_;
   bool preload_additional_catalog_tables_ = false;
+  bool use_relcache_file_ = true;
 };
 
 struct MetricCounters {
@@ -150,6 +161,7 @@ class PgCatalogPerfTestBase : public PgMiniTestBase {
         config.preload_additional_catalog_list().value_or("");
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_catalog_preload_additional_tables) =
         config.preload_additional_catalog_tables();
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_use_relcache_file) = config.use_relcache_file();
     PgMiniTestBase::SetUp();
     metrics_.emplace(GetMetricMap(*cluster_->mini_master()->master()),
                      GetMetricMap(*cluster_->mini_tablet_server(0)->server()));
@@ -262,6 +274,10 @@ const Configuration kConfigWithPreloadAdditionalCatBoth(
     /*minimal_catalog_caches_preload=*/false, kResponseCacheSize5MB,
     "pg_statistic,pg_invalid", /*preload_catalog_tables*/true);
 
+const Configuration kConfigPredictableMemoryUsage(
+    /*minimal_catalog_caches_preload=*/false, "", 
+    /*preload_catalog_tables*/false, /*use_relcache_file*/false);
+
 template<class Base, const Configuration& Config>
 class ConfigurableTest : public Base {
  private:
@@ -282,6 +298,8 @@ using PgPreloadAdditionalCatTablesTest =
     ConfigurableTest<PgCatalogPerfTestBase, kConfigWithPreloadAdditionalCatTables>;
 using PgPreloadAdditionalCatBothTest =
     ConfigurableTest<PgCatalogPerfTestBase, kConfigWithPreloadAdditionalCatBoth>;
+using PgPredictableMemoryUsageTest =
+    ConfigurableTest<PgCatalogPerfTestBase, kConfigPredictableMemoryUsage>;
 
 class PgCatalogWithStaleResponseCacheTest : public PgCatalogWithUnlimitedCachePerfTest {
  protected:
@@ -413,8 +431,8 @@ TEST_F_EX(PgCatalogPerfTest,
     RETURN_NOT_OK(Connect());
     return static_cast<Status>(Status::OK());
   }));
-  ASSERT_EQ(metrics.cache.queries, 4);
-  ASSERT_EQ(metrics.cache.hits, 4);
+  ASSERT_EQ(metrics.cache.queries, 1);
+  ASSERT_EQ(metrics.cache.hits, 0);
 }
 
 // The test checks response cache renewing process in case of 'Snapshot too old' error.
@@ -448,9 +466,9 @@ TEST_F_EX(PgCatalogPerfTest,
 
   auto second_connection_cache_metrics = ASSERT_RESULT(metrics_->Delta(connector)).cache;
   ASSERT_EQ(second_connection_cache_metrics.renew_hard, 0);
-  ASSERT_EQ(second_connection_cache_metrics.renew_soft, 1);
-  ASSERT_EQ(second_connection_cache_metrics.hits, 1);
-  ASSERT_EQ(second_connection_cache_metrics.queries, 6);
+  ASSERT_EQ(second_connection_cache_metrics.renew_soft, 0);
+  ASSERT_EQ(second_connection_cache_metrics.hits, 0);
+  ASSERT_EQ(second_connection_cache_metrics.queries, 1);
 }
 
 // The test checks that GC keeps response cache memory lower than limit
@@ -468,7 +486,7 @@ TEST_F_EX(PgCatalogPerfTest, ResponseCacheMemoryLimit, PgCatalogWithLimitedCache
         return static_cast<Status>(Status::OK());
       })).cache;
   ASSERT_EQ(cache_metrics.gc_calls, 9);
-  ASSERT_EQ(cache_metrics.entries_removed_by_gc, 26);
+  ASSERT_EQ(cache_metrics.entries_removed_by_gc, 27);
   auto response_cache_mem_tracker =
       cluster_->mini_tablet_server(0)->server()->mem_tracker()->FindChild("PgResponseCache");
   ASSERT_TRUE(response_cache_mem_tracker);
@@ -551,6 +569,15 @@ TEST_F_EX(PgCatalogPerfTest,
   const auto rpc_count = ASSERT_RESULT(RPCCountOnStartUp());
   // This value should be no less than the first connection RPC value in the StartupRPCCount test.
   ASSERT_EQ(rpc_count, 7);
+}
+
+TEST_F_EX(PgCatalogPerfTest,
+          RPCCountOnStartupPredictableMemoryUsage,
+          PgPredictableMemoryUsageTest) {
+  const auto first_connect_rpc_count = ASSERT_RESULT(RPCCountOnStartUp());
+  ASSERT_EQ(first_connect_rpc_count, 5);
+  const auto subsequent_connect_rpc_count = ASSERT_RESULT(RPCCountOnStartUp());
+  ASSERT_EQ(subsequent_connect_rpc_count, 5);
 }
 
 } // namespace yb::pgwrapper
