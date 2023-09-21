@@ -603,6 +603,15 @@ YBCanEnableDBCatalogVersionMode()
 	return (YbGetNumberOfDatabases() > 1);
 }
 
+/*
+ * Returns true if we 
+ */
+bool YbNeedAdditionalCatalogTables() 
+{
+	return *YBCGetGFlags()->ysql_catalog_preload_additional_tables ||
+			IS_NON_EMPTY_STR_FLAG(YBCGetGFlags()->ysql_catalog_preload_additional_table_list);
+}
+
 void
 YBReportFeatureUnsupported(const char *msg)
 {
