@@ -1307,7 +1307,7 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     Tablespace[] tablespaces = generateTestTablespaces();
     Arrays.stream(tablespaces).forEach(Tablespace::create);
 
-    // Create the table + index.
+    // Create the table.
     try (Statement stmt = connection.createStatement()) {
       stmt.execute("CREATE TABLE concurrent_test_tbl " +
         "(k INT PRIMARY KEY, v1 INT DEFAULT 10, v2 INT DEFAULT 20)");
@@ -1537,6 +1537,14 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     // Verify that the table has the right number of rows.
     assertEquals(numDmlThreads * numStmtsPerThread, getNumRows("concurrent_test_tbl"));
 
+    // Verify that the index has the right number of rows using an index-only scan hint.
+    try (Statement stmt = connection.createStatement()) {
+      Row countRow = getSingleRow(stmt,
+        "/*+ IndexOnlyScan(concurrent_test_tbl concurrent_test_idx) */ " +
+          "SELECT COUNT(v1) FROM concurrent_test_tbl");
+      assertEquals(numDmlThreads * numStmtsPerThread, (long) countRow.getLong(0));
+    }
+
     // Verify that the index is placed according to the expected final tablespace.
     verifyCustomPlacement("concurrent_test_idx", expectedFinalTablespace);
     LOG.info("testAlterTableSetTablespaceConcurrent completed successfully");
@@ -1564,7 +1572,7 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     Tablespace[] tablespaces = generateTestTablespaces();
     Arrays.stream(tablespaces).forEach(Tablespace::create);
 
-    // Create the table + index.
+    // Create the table + matview.
     try (Statement stmt = connection.createStatement()) {
       stmt.execute("CREATE TABLE concurrent_test_tbl " +
         "(k INT PRIMARY KEY, v1 INT DEFAULT 10, v2 INT DEFAULT 20)");
