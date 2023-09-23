@@ -91,7 +91,7 @@ class Configuration {
       : Configuration(minimal_catalog_caches_preload, response_cache_size_bytes,
         preload_catalog_list, false, true) {}
 
-  constexpr Configuration(
+  Configuration(
       bool minimal_catalog_caches_preload, uint64_t response_cache_size_bytes,
       const std::string& preload_catalog_list, bool preload_catalog_tables)
       : Configuration(
