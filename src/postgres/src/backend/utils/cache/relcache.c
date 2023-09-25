@@ -2844,10 +2844,6 @@ YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
 		YbRegisterTables(prefetcher, tables, lengthof(tables));
 	}
 
-	YBCStatus status = YbPrefetch(prefetcher);
-	if (status)
-		return status;
-
 	if (YbNeedAdditionalCatalogTables())
 	{
 		static const YbPFetchTable tables[] = {
@@ -2860,6 +2856,10 @@ YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
 		};
 		YbRegisterTables(prefetcher, tables, lengthof(tables));
 	}
+
+	YBCStatus status = YbPrefetch(prefetcher);
+	if (status)
+		return status;
 
 	/*
 	 * The preloading catalog cache before processing relations will help to
