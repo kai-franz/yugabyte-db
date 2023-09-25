@@ -16,10 +16,19 @@ UPDATE pg_index SET indisvalid = false
     WHERE indexrelid = 'pg_depend_depender_index'::regclass;
 UPDATE pg_index SET indisvalid = false
     WHERE indexrelid = 'yb_j_idx'::regclass;
+SELECT
+$$
+SET yb_non_ddl_txn_for_sys_tables_allowed TO on;
+UPDATE pg_yb_catalog_version SET current_version = current_version + 1;
+UPDATE pg_yb_catalog_version SET last_breaking_version = current_version;
+RESET yb_non_ddl_txn_for_sys_tables_allowed;
+$$ AS force_cache_refresh \gset
 -- Force cache refresh.  The UPDATE pg_yb_catalog_version trick doesn't seem to
--- work for pg_depend_depender_index, but reconnecting does.  Since
--- reconnecting releases temp tables, do this refresh first before creating
--- temp tables.
+-- work for pg_depend_depender_index, but updating the pg_yb_catalog_version
+-- and then reconnecting does (simply reconnecting doesn't result in a cache
+-- refresh when the tserver response cache is enabled). Since reconnecting
+-- releases temp tables, do this refresh first before creating temp tables.
+:force_cache_refresh
 \c
 
 CREATE TEMP TABLE tmp (i int PRIMARY KEY, j int);
@@ -108,10 +117,7 @@ SELECT i FROM yb WHERE j = -5;
 UPDATE pg_index SET indislive = false, indisready = false, indisvalid = false
     WHERE indexrelid = 'tmp_j_idx'::regclass;
 --- Force cache refresh.
-SET yb_non_ddl_txn_for_sys_tables_allowed TO on;
-UPDATE pg_yb_catalog_version SET current_version = current_version + 1;
-UPDATE pg_yb_catalog_version SET last_breaking_version = current_version;
-RESET yb_non_ddl_txn_for_sys_tables_allowed;
+:force_cache_refresh
 SELECT distinct(current_version = last_breaking_version) from pg_yb_catalog_version;
 -- Do update that goes to table but doesn't go to index.
 UPDATE tmp SET i = 11 WHERE j = -5;
@@ -119,10 +125,7 @@ UPDATE tmp SET i = 11 WHERE j = -5;
 UPDATE pg_index SET indislive = true, indisready = true, indisvalid = true
     WHERE indexrelid = 'tmp_j_idx'::regclass;
 --- Force cache refresh.
-SET yb_non_ddl_txn_for_sys_tables_allowed TO on;
-UPDATE pg_yb_catalog_version SET current_version = current_version + 1;
-UPDATE pg_yb_catalog_version SET last_breaking_version = current_version;
-RESET yb_non_ddl_txn_for_sys_tables_allowed;
+:force_cache_refresh
 SELECT distinct(current_version = last_breaking_version) from pg_yb_catalog_version;
 -- Show the corruption.
 /*+SeqScan(tmp) */
@@ -133,10 +136,7 @@ SELECT i FROM tmp WHERE j = -5;
 UPDATE pg_index SET indislive = false, indisready = false, indisvalid = false
     WHERE indexrelid = 'tmp_j_idx'::regclass;
 --- Force cache refresh.
-SET yb_non_ddl_txn_for_sys_tables_allowed TO on;
-UPDATE pg_yb_catalog_version SET current_version = current_version + 1;
-UPDATE pg_yb_catalog_version SET last_breaking_version = current_version;
-RESET yb_non_ddl_txn_for_sys_tables_allowed;
+:force_cache_refresh
 SELECT distinct(current_version = last_breaking_version) from pg_yb_catalog_version;
 
 -- 3. reindex (for temp index)
@@ -166,6 +166,7 @@ UPDATE pg_index SET indislive = false, indisready = false, indisvalid = false
 UPDATE pg_index SET indislive = false, indisready = false, indisvalid = false
     WHERE indexrelid = 'yb_j_idx'::regclass;
 -- Force cache refresh.
+:force_cache_refresh
 \c
 -- Do updates that go to tables but don't go to indexes.
 SET yb_non_ddl_txn_for_sys_tables_allowed TO on;
@@ -184,6 +185,7 @@ UPDATE pg_index SET indislive = true, indisready = true, indisvalid = true
 UPDATE pg_index SET indislive = true, indisready = true, indisvalid = true
     WHERE indexrelid = 'yb_j_idx'::regclass;
 -- Force cache refresh.
+:force_cache_refresh
 \c
 -- Show the corruptions.
 /*+SeqScan(pg_depend) */
@@ -202,8 +204,8 @@ UPDATE pg_index SET indisvalid = false
 UPDATE pg_index SET indisvalid = false
     WHERE indexrelid = 'yb_j_idx'::regclass;
 -- Force cache refresh.
+:force_cache_refresh
 \c
-
 -- 6. reindex (for YB indexes)
 REINDEX INDEX pg_depend_depender_index;
 REINDEX INDEX yb_j_idx;
