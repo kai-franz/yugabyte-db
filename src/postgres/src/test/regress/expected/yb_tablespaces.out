@@ -87,6 +87,11 @@ WARNING:  LOCATION not supported yet and will be ignored
 LINE 1: CREATE TABLESPACE regress_tblspace LOCATION '/data';
                                            ^
 HINT:  See https://github.com/yugabyte/yugabyte-db/issues/6569. React with thumbs up to raise its priority
+CREATE TABLESPACE regress_tblspace_2 LOCATION '/data';
+WARNING:  LOCATION not supported yet and will be ignored
+LINE 1: CREATE TABLESPACE regress_tblspace_2 LOCATION '/data';
+                                             ^
+HINT:  See https://github.com/yugabyte/yugabyte-db/issues/6569. React with thumbs up to raise its priority
 -- try setting and resetting some properties for the new tablespace
 ALTER TABLESPACE regress_tblspace SET (random_page_cost = 1.0, seq_page_cost = 1.1);
 ERROR:  ALTER TABLESPACE not supported yet
@@ -161,6 +166,9 @@ Indexes:
     "foo_pk_pkey" PRIMARY KEY, lsm (i HASH), tablespace "regress_tblspace"
 Tablespace: "regress_tblspace"
 
+-- Fail, cannot ALTER INDEX SET TABLESPACE for primary key index.
+ALTER INDEX testschema.foo_pk_pkey SET TABLESPACE regress_tblspace_2;
+ERROR:  cannot set tablespace for primary key index
 -- Create table with primary key after default tablespace is changed.
 SET default_tablespace TO regress_tblspace;
 CREATE TABLE testschema.foo_pk_default_tblspc (i int, PRIMARY KEY(i));
@@ -181,6 +189,9 @@ Indexes:
     "foo_pk_default_tblspc_pkey" PRIMARY KEY, lsm (i HASH), tablespace "regress_tblspace"
 Tablespace: "regress_tblspace"
 
+-- Fail, cannot ALTER INDEX SET TABLESPACE for primary key index.
+ALTER INDEX testschema.foo_pk_pkey SET TABLESPACE pg_default;
+ERROR:  cannot set tablespace for primary key index
 SET default_tablespace TO '';
 -- Verify that USING INDEX TABLESPACE is not supported for primary keys.
 CREATE TABLE testschema.using_index1 (a int PRIMARY KEY USING INDEX TABLESPACE regress_tblspace);

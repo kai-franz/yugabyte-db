@@ -257,6 +257,10 @@ public class TestTablespaceProperties extends BasePgSQLTest {
       String errorMsg = "TABLESPACE is not supported for indexes on colocated tables.";
       executeAndAssertErrorThrown("CREATE INDEX t_idx2 ON t(b) TABLESPACE testTablespace",
                                   errorMsg);
+
+      // ALTER INDEX SET TABLESPACE.
+      errorMsg = "ALTER INDEX SET TABLESPACE is not supported for indexes on colocated tables.";
+      executeAndAssertErrorThrown("ALTER INDEX t_idx2 SET TABLESPACE testTablespace", errorMsg);
     }
   }
 
