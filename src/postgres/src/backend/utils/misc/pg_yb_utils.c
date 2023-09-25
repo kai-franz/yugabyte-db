@@ -627,7 +627,7 @@ YBCanEnableDBCatalogVersionMode()
 }
 
 /*
- * Returns true if we 
+ * Used to determine whether we should preload certain catalog tables.
  */
 bool YbNeedAdditionalCatalogTables() 
 {

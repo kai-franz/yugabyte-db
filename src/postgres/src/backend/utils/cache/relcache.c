@@ -2848,6 +2848,19 @@ YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
 	if (status)
 		return status;
 
+	if (YbNeedAdditionalCatalogTables())
+	{
+		static const YbPFetchTable tables[] = {
+			YB_PFETCH_TABLE_PG_CAST,
+			YB_PFETCH_TABLE_PG_INHERITS,
+			YB_PFETCH_TABLE_PG_POLICY,
+			YB_PFETCH_TABLE_PG_PROC,
+			YB_PFETCH_TABLE_PG_TABLESPACE,
+			YB_PFETCH_TABLE_PG_TRIGGER
+		};
+		YbRegisterTables(prefetcher, tables, lengthof(tables));
+	}
+
 	/*
 	 * The preloading catalog cache before processing relations will help to
 	 * avoid sequential scans over prefetched data.
