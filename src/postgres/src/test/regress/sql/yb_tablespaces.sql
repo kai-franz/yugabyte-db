@@ -59,6 +59,7 @@ DROP TABLESPACE regress_tblspacewith;
 
 -- create a tablespace we can use
 CREATE TABLESPACE regress_tblspace LOCATION '/data';
+CREATE TABLESPACE regress_tblspace_2 LOCATION '/data';
 
 -- try setting and resetting some properties for the new tablespace
 ALTER TABLESPACE regress_tblspace SET (random_page_cost = 1.0, seq_page_cost = 1.1);
@@ -108,12 +109,16 @@ SELECT relname, spcname FROM pg_catalog.pg_tablespace t, pg_catalog.pg_class c
 CREATE TABLE testschema.foo_pk (i int, PRIMARY KEY(i)) TABLESPACE regress_tblspace;
 \d testschema.foo_pk_pkey
 \d testschema.foo_pk;
+-- Fail, cannot ALTER INDEX SET TABLESPACE for primary key index.
+ALTER INDEX testschema.foo_pk_pkey SET TABLESPACE regress_tblspace_2;
 
 -- Create table with primary key after default tablespace is changed.
 SET default_tablespace TO regress_tblspace;
 CREATE TABLE testschema.foo_pk_default_tblspc (i int, PRIMARY KEY(i));
 \d testschema.foo_pk_default_tblspc_pkey;
 \d testschema.foo_pk_default_tblspc;
+-- Fail, cannot ALTER INDEX SET TABLESPACE for primary key index.
+ALTER INDEX testschema.foo_pk_pkey SET TABLESPACE pg_default;
 SET default_tablespace TO '';
 
 -- Verify that USING INDEX TABLESPACE is not supported for primary keys.

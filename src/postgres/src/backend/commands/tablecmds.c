@@ -11918,6 +11918,18 @@ ATPrepSetTableSpace(AlteredTableInfo *tab, Relation rel, const char *tablespacen
 				 errmsg("cannot set tablespaces for temporary tables")));
 	}
 
+	if (IsYugaByteEnabled() && tablespacename && 
+		rel->rd_index &&
+		rel->rd_index->indisprimary) {
+		/*
+		 * Disable setting tablespaces for primary key indexes in Yugabyte
+		 * clusters.
+		 */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("cannot set tablespace for primary key index")));
+	}
+
 	/* Check that the tablespace exists */
 	tablespaceId = get_tablespace_oid(tablespacename, false);
 
