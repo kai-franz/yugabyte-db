@@ -911,6 +911,20 @@ public class TestTablespaceProperties extends BasePgSQLTest {
     for (final String table : tablesWithCustomPlacement) {
       verifyCustomPlacement(table);
     }
+
+    // ALTER TABLE SET TABLESPACE pg_default and then verify its placement.
+    try (Statement setupStatement = connection.createStatement()) {
+      for (final String table : tablesWithDefaultPlacement) {
+        setupStatement.execute("ALTER TABLE " + table + " SET TABLESPACE pg_default");
+      }
+    }
+
+    for (final String table : tablesWithDefaultPlacement) {
+      verifyPlacementForReadReplica(table);
+    }
+    for (final String table : tablesWithCustomPlacement) {
+      verifyCustomPlacement(table);
+    }
   }
 
   void verifyPlacementForReadReplica(final String table) throws Exception {
