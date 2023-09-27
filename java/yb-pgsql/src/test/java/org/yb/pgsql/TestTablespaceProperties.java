@@ -1688,6 +1688,12 @@ public class TestTablespaceProperties extends BasePgSQLTest {
       assertEquals(0, (long) row.getLong(0));
     }
     verifyCustomPlacement("concurrent_test_mv", expectedFinalTablespace);
+
+    // Refresh the materialized view and verify its placement
+    try (Statement stmt = connection.createStatement()) {
+      stmt.execute("REFRESH MATERIALIZED VIEW concurrent_test_mv");
+    }
+    verifyCustomPlacement("concurrent_test_mv", expectedFinalTablespace);
   }
 
   /**
