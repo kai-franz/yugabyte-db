@@ -98,6 +98,8 @@ static bool ThereIsAtLeastOneRole(void);
 static void process_startup_options(Port *port, bool am_superuser);
 static void process_settings(Oid databaseid, Oid roleid);
 
+static void YbEnsureSysTablePrefetchingStopped();
+
 /*** InitPostgres support ***/
 
 
@@ -317,6 +319,14 @@ CheckMyDatabase(const char *name, bool am_superuser, bool override_allow_connect
 	Form_pg_database dbform;
 	char	   *collate;
 	char	   *ctype;
+
+	/*
+	 * Bypass the T-Server catalog cache and read the pg_database row directly
+	 * from master. We need to do this because the T-Server catalog cache may 
+	 * not be up to date e.g. if this database was just created.
+	 */
+	YBCPgResetCatalogReadTime();
+	YbEnsureSysTablePrefetchingStopped();
 
 	/* Fetch our pg_database row normally, via syscache */
 	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
