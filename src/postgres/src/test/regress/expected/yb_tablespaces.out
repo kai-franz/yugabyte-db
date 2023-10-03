@@ -219,6 +219,15 @@ Indexes:
 Indexes:
     "using_index3_a_key" UNIQUE CONSTRAINT, lsm (a HASH), tablespace "regress_tblspace"
 
+ALTER INDEX testschema.using_index2_a_key SET TABLESPACE pg_default;
+\d testschema.using_index2;
+          Table "testschema.using_index2"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ a      | integer |           |          |
+Indexes:
+    "using_index2_a_key" UNIQUE CONSTRAINT, lsm (a HASH)
+
 -- index
 CREATE INDEX foo_idx on testschema.foo(i) TABLESPACE regress_tblspace;
 SELECT relname, spcname FROM pg_catalog.pg_tablespace t, pg_catalog.pg_class c

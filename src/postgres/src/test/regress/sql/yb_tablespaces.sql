@@ -131,6 +131,9 @@ CREATE TABLE testschema.using_index3 (a int, UNIQUE(a) USING INDEX TABLESPACE re
 \d testschema.using_index2;
 \d testschema.using_index3;
 
+ALTER INDEX testschema.using_index2_a_key SET TABLESPACE pg_default;
+\d testschema.using_index2;
+
 -- index
 CREATE INDEX foo_idx on testschema.foo(i) TABLESPACE regress_tblspace;
 SELECT relname, spcname FROM pg_catalog.pg_tablespace t, pg_catalog.pg_class c
