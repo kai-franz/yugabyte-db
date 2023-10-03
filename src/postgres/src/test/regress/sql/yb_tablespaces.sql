@@ -176,6 +176,13 @@ CREATE TABLE testschema.part2 PARTITION OF testschema.part FOR VALUES IN (2);
 SELECT relname, spcname FROM pg_catalog.pg_tablespace t, pg_catalog.pg_class c
     where c.reltablespace = t.oid AND c.relname LIKE 'part%_idx' ORDER BY relname;
 
+CREATE TABLE testschema.part34 PARTITION OF testschema.part FOR VALUES IN (3, 4) PARTITION BY LIST (a);
+CREATE TABLE testschema.part3 PARTITION OF testschema.part34 FOR VALUES IN (3);
+ALTER INDEX testschema.part34_a_idx SET TABLESPACE pg_default;
+CREATE TABLE testschema.part4 PARTITION OF testschema.part34 FOR VALUES IN (4);
+SELECT relname, spcname FROM pg_catalog.pg_class c LEFT OUTER JOIN pg_catalog.pg_tablespace t
+    ON c.reltablespace = t.oid WHERE c.relname LIKE 'part%_idx' ORDER BY relname;
+
 -- check that default_tablespace doesn't affect ALTER TABLE index rebuilds
 CREATE TABLE testschema.test_default_tab(id bigint) TABLESPACE regress_tblspace;
 INSERT INTO testschema.test_default_tab VALUES (1);

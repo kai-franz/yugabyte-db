@@ -285,6 +285,22 @@ SELECT relname, spcname FROM pg_catalog.pg_tablespace t, pg_catalog.pg_class c
  part_a_idx  | regress_tblspace
 (3 rows)
 
+CREATE TABLE testschema.part34 PARTITION OF testschema.part FOR VALUES IN (3, 4) PARTITION BY LIST (a);
+CREATE TABLE testschema.part3 PARTITION OF testschema.part34 FOR VALUES IN (3);
+ALTER INDEX testschema.part34_a_idx SET TABLESPACE pg_default;
+CREATE TABLE testschema.part4 PARTITION OF testschema.part34 FOR VALUES IN (4);
+SELECT relname, spcname FROM pg_catalog.pg_class c LEFT OUTER JOIN pg_catalog.pg_tablespace t
+    ON c.reltablespace = t.oid WHERE c.relname LIKE 'part%_idx' ORDER BY relname;
+   relname    |     spcname
+--------------+------------------
+ part1_a_idx  | regress_tblspace
+ part2_a_idx  | regress_tblspace
+ part34_a_idx |
+ part3_a_idx  | regress_tblspace
+ part4_a_idx  |
+ part_a_idx   | regress_tblspace
+(6 rows)
+
 -- check that default_tablespace doesn't affect ALTER TABLE index rebuilds
 CREATE TABLE testschema.test_default_tab(id bigint) TABLESPACE regress_tblspace;
 INSERT INTO testschema.test_default_tab VALUES (1);
@@ -457,7 +473,7 @@ ERROR:  only shared relations can be placed in pg_global tablespace
 Partition key: LIST (a)
 Indexes:
     "part_a_idx" lsm (a HASH), tablespace "regress_tblspace"
-Number of partitions: 2 (Use \d+ to list them.)
+Number of partitions: 3 (Use \d+ to list them.)
 
 ALTER INDEX testschema.part_a_idx SET TABLESPACE pg_default;
 \d testschema.part
@@ -468,7 +484,7 @@ ALTER INDEX testschema.part_a_idx SET TABLESPACE pg_default;
 Partition key: LIST (a)
 Indexes:
     "part_a_idx" lsm (a HASH)
-Number of partitions: 2 (Use \d+ to list them.)
+Number of partitions: 3 (Use \d+ to list them.)
 
 ALTER INDEX testschema.part_a_idx SET TABLESPACE regress_tblspace;
 \d testschema.part
@@ -479,7 +495,7 @@ ALTER INDEX testschema.part_a_idx SET TABLESPACE regress_tblspace;
 Partition key: LIST (a)
 Indexes:
     "part_a_idx" lsm (a HASH), tablespace "regress_tblspace"
-Number of partitions: 2 (Use \d+ to list them.)
+Number of partitions: 3 (Use \d+ to list them.)
 
 INSERT INTO testschema.atable VALUES(3);
 INSERT INTO testschema.atable VALUES(1);
