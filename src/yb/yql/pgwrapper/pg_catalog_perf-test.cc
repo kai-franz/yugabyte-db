@@ -556,4 +556,25 @@ TEST_F_EX(PgCatalogPerfTest,
   ASSERT_EQ(rpc_count, kFirstConnectionRPCCountWithAdditionalTables);
 }
 
+// The following test tests that the response cache is DB-specific. 
+// It creates two databases, and then creates a table in each database.
+// It then checks that the response cache is not shared between the two databases.
+TEST_F(PgCatalogPerfTest, ResponseCacheIsDBSpecific) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE DATABASE db1"));
+  ASSERT_OK(conn.Execute("CREATE DATABASE db2"));
+  ASSERT_OK(conn.Execute("CREATE TABLE db1.t1 (id int)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE db2.t2 (id int)"));
+  auto aux_conn = ASSERT_RESULT(ConnectToDB("db1"));
+  ASSERT_OK(aux_conn.Execute("CREATE TABLE db1.t3 (id int)"));
+  ASSERT_OK(aux_conn.Execute("CREATE TABLE db2.t4 (id int)"));
+  auto metrics = ASSERT_RESULT(metrics_->Delta([&conn, &aux_conn] {
+    RETURN_NOT_OK(conn.Execute("CREATE TABLE db1.t5 (id int)"));
+    RETURN_NOT_OK(aux_conn.Execute("CREATE TABLE db2.t6 (id int)"));
+    return static_cast<Status>(Status::OK());
+  }));
+  ASSERT_EQ(metrics.cache.queries, 4);
+  ASSERT_EQ(metrics.cache.hits, 4);
+}
+
 } // namespace yb::pgwrapper
