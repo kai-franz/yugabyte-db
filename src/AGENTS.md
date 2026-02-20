@@ -5,7 +5,7 @@ The primary build entry point is `yb_build.sh` at the repository root.
 Use release build by default. Only use debug builds when explicitly asked to do so.
 Skip java build (`--sj`) unless you have to run java tests.
 
-The first time you run a test, you will need to run initdb before hand:
+The first time you run a test, you will need to run initdb beforehand:
 
 ```bash
 ./yb_build.sh release initdb
