@@ -1,0 +1,6 @@
+// Use the latest image from https://github.com/yugabyte/build-infra
+{
+    "build": {
+        "dockerfile": "Dockerfile"
+    }
+}
