@@ -1,19 +1,29 @@
 # AGENTS.md
 
-This document provides a guide for agents working on the YugabyteDB codebase.
+This document provides a guide for agents working on YugabyteDB
 
-### Code Structure
+Use release builds by default since they are faster to use. Only use debug (default) builds when explicitly asked to do so
 
-DB code lives in the `src/postgres/` and `src/yb/` directories.
+### Deploying and running
 
-```
-src/
-├── postgres/
-├── yb/
-└── AGENTS.md
-```
+For agents that want to deploy, configure and run YugabyteDB refer to instructions at https://docs.yugabyte.com/stable/quick-start
 
-There are also DB tests in the `java/` directory.
+### Repo Structure
 
-When working on DB code, refer to `src/AGENTS.md` for guidance.
+| Directory | What it contains |
+|---|---|
+| `src/` | Core database code: PostgreSQL fork (`src/postgres/`), YugabyteDB C++ storage engine (`src/yb/`), Odyssey connection pooler (`src/odyssey/`) |
+| `java/` | Java client library, CDC connector, and DB tests |
+| `managed/` | YugabyteDB Anywhere (YBA) platform — orchestration UI, CLI, node agent, and backend (Scala/Java) |
+| `docs/` | Source files for the docs website (docs.yugabyte.com) |
+| `python/` | Python build utilities and test infrastructure scripts |
+| `build-support/` | Build system scripts, linting, and third-party dependency tooling |
+| `cmake_modules/` | CMake modules for locating dependencies and custom build functions |
+| `cloud/` | Docker, Kubernetes, and Grafana deployment configurations |
+| `yugabyted-ui/` | Yugabyted web UI (React frontend + Go API server) |
+| `architecture/` | Internal design documents and architecture specs |
+| `troubleshoot/` | Troubleshooting framework backend and UI |
 
+### Coding and Development
+
+When working on DB code (`src/`), refer to `src/AGENTS.md` for build and test guidance
