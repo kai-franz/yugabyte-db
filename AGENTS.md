@@ -2,8 +2,6 @@
 
 This document provides a guide for agents working on YugabyteDB
 
-Use release builds by default since they are faster to use. Only use debug (default) builds when explicitly asked to do so
-
 ### Deploying and running
 
 For agents that want to deploy, configure and run YugabyteDB refer to instructions at https://docs.yugabyte.com/stable/quick-start
