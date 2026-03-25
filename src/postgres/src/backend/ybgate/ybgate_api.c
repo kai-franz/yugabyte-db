@@ -36,11 +36,13 @@
 #include "funcapi.h"
 #include "libpq/hba.h"
 #include "mb/pg_wchar.h"
+#include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/primnodes.h"
 #include "pg_yb_utils.h"
+#include "pgtime.h"
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/lsyscache.h"
@@ -53,11 +55,29 @@
 #include "ybgate/ybgate_api.h"
 
 YbgStatus
-YbgInit()
+YbgInit(const char *postgres_exec_path)
 {
 	PG_SETUP_ERROR_REPORTING();
 
 	SetDatabaseEncoding(PG_UTF8);
+
+	/*
+	 * Set my_exec_path so that timezone file lookups can locate PGSHAREDIR.
+	 * Without this, pg_tzset() cannot find IANA timezone data files (e.g.
+	 * "UTC"), causing "time zone not recognized" errors when expressions
+	 * containing AT TIME ZONE with named timezones are pushed down to DocDB.
+	 */
+	if (postgres_exec_path != NULL && postgres_exec_path[0] != '\0')
+	{
+		strlcpy(my_exec_path, postgres_exec_path, sizeof(my_exec_path));
+
+		/*
+		 * Initialize session_timezone to GMT.  This allows pg_tzset() to
+		 * populate its cache hashtable before any per-query evaluation, and
+		 * ensures a valid session_timezone exists for functions that read it.
+		 */
+		pg_timezone_initialize();
+	}
 
 	PG_STATUS_OK();
 }
