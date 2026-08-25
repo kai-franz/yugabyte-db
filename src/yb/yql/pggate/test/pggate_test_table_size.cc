@@ -14,6 +14,7 @@
 //--------------------------------------------------------------------------------------------------
 
 #include <chrono>
+#include <filesystem>
 #include <string>
 
 #include "yb/common/constants.h"
@@ -23,6 +24,7 @@
 
 #include "yb/integration-tests/external_mini_cluster_fs_inspector.h"
 
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/path_util.h"
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
@@ -38,6 +40,19 @@ namespace pggate {
 
 namespace {
 
+constexpr auto kTableSizeTimeout = 30s;
+
+// GetTableDiskSize reports regular-DB live SST size, not intents/snapshots.
+bool IsRegularSstFile(const std::string& file) {
+  const auto path = std::filesystem::path(file);
+  for (const auto& part : path) {
+    if (part == "intents" || part == "snapshots") {
+      return false;
+    }
+  }
+  return true;
+}
+
 Result<int64> TotalSize(const std::vector<std::string>& files) {
   int64_t size = 0;
   Env* env = Env::Default();
@@ -48,27 +63,60 @@ Result<int64> TotalSize(const std::vector<std::string>& files) {
 }
 
 Result<int64> GetWalAndSstSizeForTable(ExternalMiniCluster* cluster, const TableId& table_id) {
-  int64_t size = 0;
+  int64_t wal_size = 0;
+  int64_t sst_size = 0;
+  size_t wal_files = 0;
+  size_t sst_files = 0;
   itest::ExternalMiniClusterFsInspector inspector {cluster};
   for (size_t i = 0; i < cluster->num_tablet_servers(); ++i) {
-    size += VERIFY_RESULT(TotalSize(VERIFY_RESULT(inspector.ListTableWalFilesOnTS(i, table_id))));
-    size += VERIFY_RESULT(TotalSize(VERIFY_RESULT(inspector.ListTableSstFilesOnTS(i, table_id))));
+    auto wals = VERIFY_RESULT(inspector.ListTableWalFilesOnTS(i, table_id));
+    auto ssts = VERIFY_RESULT(inspector.ListTableSstFilesOnTS(i, table_id));
+    std::erase_if(ssts, [](const auto& file) { return !IsRegularSstFile(file); });
+    wal_files += wals.size();
+    sst_files += ssts.size();
+    wal_size += VERIFY_RESULT(TotalSize(wals));
+    sst_size += VERIFY_RESULT(TotalSize(ssts));
   }
-  return size;
+  LOG(INFO) << "On-disk size for " << table_id << ": wal=" << wal_size << " (" << wal_files
+            << " files) sst=" << sst_size << " (" << sst_files << " files)";
+  return wal_size + sst_size;
 }
 
 } // namespace
 
 class PggateTestTableSize : public PggateTest {
  public:
-  Status VerifyTableSize(YbcPgOid table_oid, const std::string& table_name, int64_t disk_size) {
+  void CustomizeExternalMiniCluster(ExternalMiniClusterOptions* opts) override {
+    opts->extra_tserver_flags.push_back("--tserver_heartbeat_metrics_interval_ms=500");
+  }
+
+  Status VerifyTableSize(YbcPgOid table_oid, const std::string& table_name) {
     const auto table_id = PgObjectId(kDefaultDatabaseOid, table_oid).GetYbTableId();
-    const auto file_size = VERIFY_RESULT(GetWalAndSstSizeForTable(cluster_.get(), table_id));
-    if (disk_size != file_size) {
-      return STATUS_FORMAT(IllegalState, "Table size mismatch for table $0: $1 vs $2",
-                           table_name, disk_size, file_size);
-    }
-    return Status::OK();
+    return LoggedWaitFor(
+        [this, table_oid, table_name, table_id]() -> Result<bool> {
+          int64_t disk_size = 0;
+          int32_t num_missing_tablets = 0;
+          YbcStatus ybc_status = YBCPgGetTableDiskSize(
+              table_oid, kDefaultDatabaseOid, &disk_size, &num_missing_tablets);
+          if (ybc_status) {
+            return Status(ybc_status, AddRef::kFalse);
+          }
+          if (num_missing_tablets != 0) {
+            LOG(INFO) << "Table " << table_name << " still missing " << num_missing_tablets
+                      << " tablets";
+            return false;
+          }
+          const auto file_size =
+              VERIFY_RESULT(GetWalAndSstSizeForTable(cluster_.get(), table_id));
+          if (disk_size == file_size) {
+            return true;
+          }
+          LOG(INFO) << "Table size mismatch for table " << table_name << ": " << disk_size
+                    << " vs " << file_size;
+          return false;
+        },
+        kTableSizeTimeout * kTimeMultiplier,
+        Format("table $0 size to match on-disk WAL+SST", table_name));
   }
 };
 
@@ -112,19 +160,7 @@ TEST_F(PggateTestTableSize, TestSimpleTable) {
 
   YBCPgDeleteStatement(pg_stmt);
 
-    // Wait for master heartbeat service to run
-  sleep(5);
-
-  // Calculate table size of empty table
-  int64_t disk_size = 0;
-  int32_t num_missing_tablets = 0;
-  CHECK_YBC_STATUS(YBCPgGetTableDiskSize(kTabOid,
-                                          kDefaultDatabaseOid,
-                                          &disk_size,
-                                          &num_missing_tablets));
-
-  ASSERT_OK(VerifyTableSize(kTabOid, kTabname, disk_size));
-  EXPECT_EQ(num_missing_tablets, 0) << "Unexpected missing tablets";
+  ASSERT_OK(VerifyTableSize(kTabOid, kTabname));
 
   // INSERT ----------------------------------------------------------------------------------------
   // Allocate new insert.
@@ -181,19 +217,7 @@ TEST_F(PggateTestTableSize, TestSimpleTable) {
 
   ASSERT_OK(CompactTablets(cluster_.get(), 300s * kTimeMultiplier));
 
-  // Wait for master heartbeat to run
-  sleep(5);
-
-  // Calculate table size
-  disk_size = 0;
-  num_missing_tablets = 0;
-  CHECK_YBC_STATUS(YBCPgGetTableDiskSize(kTabOid,
-                                          kDefaultDatabaseOid,
-                                          &disk_size,
-                                          &num_missing_tablets));
-
-  ASSERT_OK(VerifyTableSize(kTabOid, kTabname, disk_size));
-  EXPECT_EQ(num_missing_tablets, 0) << "Unexpected missing tablets";
+  ASSERT_OK(VerifyTableSize(kTabOid, kTabname));
 }
 
 TEST_F(PggateTestTableSize, TestMissingTablets) {
