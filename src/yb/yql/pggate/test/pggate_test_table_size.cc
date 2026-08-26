@@ -77,8 +77,8 @@ Result<int64> GetWalAndSstSizeForTable(ExternalMiniCluster* cluster, const Table
     wal_size += VERIFY_RESULT(TotalSize(wals));
     sst_size += VERIFY_RESULT(TotalSize(ssts));
   }
-  LOG(INFO) << "On-disk size for " << table_id << ": wal=" << wal_size << " (" << wal_files
-            << " files) sst=" << sst_size << " (" << sst_files << " files)";
+  VLOG(1) << "On-disk size for " << table_id << ": wal=" << wal_size << " (" << wal_files
+          << " files) sst=" << sst_size << " (" << sst_files << " files)";
   return wal_size + sst_size;
 }
 
@@ -92,8 +92,11 @@ class PggateTestTableSize : public PggateTest {
 
   Status VerifyTableSize(YbcPgOid table_oid, const std::string& table_name) {
     const auto table_id = PgObjectId(kDefaultDatabaseOid, table_oid).GetYbTableId();
+    int64_t last_disk_size = -1;
+    int64_t last_file_size = -1;
     return LoggedWaitFor(
-        [this, table_oid, table_name, table_id]() -> Result<bool> {
+        [this, table_oid, table_name, table_id, &last_disk_size,
+         &last_file_size]() -> Result<bool> {
           int64_t disk_size = 0;
           int32_t num_missing_tablets = 0;
           YbcStatus ybc_status = YBCPgGetTableDiskSize(
@@ -111,8 +114,12 @@ class PggateTestTableSize : public PggateTest {
           if (disk_size == file_size) {
             return true;
           }
-          LOG(INFO) << "Table size mismatch for table " << table_name << ": " << disk_size
-                    << " vs " << file_size;
+          if (disk_size != last_disk_size || file_size != last_file_size) {
+            LOG(INFO) << "Table size mismatch for table " << table_name << ": " << disk_size
+                      << " vs " << file_size;
+            last_disk_size = disk_size;
+            last_file_size = file_size;
+          }
           return false;
         },
         kTableSizeTimeout * kTimeMultiplier,
