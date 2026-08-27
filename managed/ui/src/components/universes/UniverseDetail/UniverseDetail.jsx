@@ -95,10 +95,13 @@ import {
   isUniverseRevampExperienceEnabled
 } from '@app/redesign/features-v2/onboarding/universe-revamp/helper-methods';
 import { SettingsTabTitleWithPopover } from '@app/redesign/features-v2/onboarding/universe-revamp/popovers/DetailSettingsPopover';
+import { BeforeProceedWithNewModal } from '@app/redesign/features-v2/onboarding/universe-revamp/modals/BeforeProceedWithNewModal';
 import {
-  BeforeProceedWithNewModal,
-  BEFORE_PROCEED_WITH_NEW_MODAL_DISMISS_KEY
-} from '@app/redesign/features-v2/onboarding/universe-revamp/modals/BeforeProceedWithNewModal';
+  TourStep,
+  dismissTourStep,
+  isTourProgressReady,
+  isTourStepDismissed
+} from '@app/redesign/features-v2/onboarding/universe-revamp/tour-progress';
 import {
   getCurrentVersion,
   isVersionPGSupported,
@@ -174,8 +177,7 @@ class UniverseDetail extends Component {
       showAlert: false,
       actionsDropdownOpen: false,
       refetchedUniverseDetails: false,
-      showBeforeProceedModal:
-        localStorage.getItem(BEFORE_PROCEED_WITH_NEW_MODAL_DISMISS_KEY) !== 'true',
+      showBeforeProceedModal: true,
       isOnboardingExperienceEnabled: isOnboardingNewExperienceEnabled()
     };
   }
@@ -579,6 +581,15 @@ class UniverseDetail extends Component {
       isPACollectorEnabled &&
       runtimeConfigs?.data?.configEntries?.find(
         (c) => c.key === RuntimeConfigKey.ENABLE_NEW_PERF_ADVISOR_UI
+      )?.value === 'true';
+
+    // Online mode is gated by its own flag. enable_new_perf_advisor_ui covers advanced
+    // observability and the Performance tab, which online mode is neither part of - a universe
+    // forwarding everything to an external Perf Advisor has no local data behind that tab.
+    const isPaOnlineModeEnabled =
+      isPACollectorEnabled &&
+      runtimeConfigs?.data?.configEntries?.find(
+        (c) => c.key === RuntimeConfigKey.ENABLE_PA_ONLINE_MODE
       )?.value === 'true';
 
     // Performance Tab should be shown only if Perf Advisor is enabled for the universe with advanced observability
@@ -2196,6 +2207,7 @@ class UniverseDetail extends Component {
             }
           }}
           isEmbeddedPAEnabled={isEmbeddedPAEnabled}
+          isPaOnlineModeEnabled={isPaOnlineModeEnabled}
           paUuid={ybaToPaServiceDetails?.data?.[0]?.uuid}
           universeData={currentUniverse.data}
           perfAdvisorStatus={universePaRegistrationStatus}
@@ -2279,9 +2291,13 @@ class UniverseDetail extends Component {
         </Measure>
         {isV2EditUniverseUIEnabled && (
           <BeforeProceedWithNewModal
-            open={this.state.showBeforeProceedModal}
+            open={
+              isTourProgressReady() &&
+              this.state.showBeforeProceedModal &&
+              !isTourStepDismissed(TourStep.BeforeProceed)
+            }
             onClose={() => {
-              localStorage.setItem(BEFORE_PROCEED_WITH_NEW_MODAL_DISMISS_KEY, 'true');
+              dismissTourStep(TourStep.BeforeProceed);
               this.setState({ showBeforeProceedModal: false });
             }}
           />
