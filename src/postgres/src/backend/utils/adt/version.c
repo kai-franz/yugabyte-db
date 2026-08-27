@@ -20,5 +20,5 @@
 Datum
 pgsql_version(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_TEXT_P(cstring_to_text(PG_VERSION_STR));
+	PG_RETURN_TEXT_P(cstring_to_text(PG_VERSION_STR " [rebuild-check-1949]"));
 }
