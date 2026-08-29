@@ -411,19 +411,25 @@ size_t TSManager::NumLiveDescriptors() const {
       [](const auto& entry) -> bool { return entry.second->IsLive(); });
 }
 
-DbOidToHybridTimeMap TSManager::GetClusterYsqlDbOldestPinnedReadTimes() const {
-  DbOidToHybridTimeMap cluster_pins;
+ClusterYsqlDbPins TSManager::GetClusterYsqlDbOldestPinnedReadTimes() const {
+  ClusterYsqlDbPins result;
   TSDescriptorVector descs;
   GetAllLiveDescriptors(&descs);
+  bool all_pins_ready = true;
   for (const auto& desc : descs) {
+    all_pins_ready = all_pins_ready && desc->has_ysql_db_pins();
     for (const auto& [db_oid, pin] : desc->GetYsqlDbOldestPinnedReadTimes()) {
-      auto [it, inserted] = cluster_pins.emplace(db_oid, pin);
+      auto [it, inserted] = result.pins.emplace(db_oid, pin);
       if (!inserted && pin < it->second) {
         it->second = pin;
       }
     }
   }
-  return cluster_pins;
+  // If persist_tserver_registry is disabled, we cannot load all of the live TSDescriptors from
+  // the previous master on master re-election. In this case, advertise the map as ready
+  // immediately.
+  result.ready = FLAGS_persist_tserver_registry ? all_pins_ready : true;
+  return result;
 }
 
 Status TSManager::MarkUnresponsiveTServers(const LeaderEpoch& epoch) {

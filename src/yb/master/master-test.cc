@@ -3228,6 +3228,29 @@ TEST_F(MasterTest, YsqlDbOldestPinnedReadTimesIgnoresInvalidHybridTime) {
   ASSERT_EQ(pins.count(1002), 0);
 }
 
+// After a master restart with persist_tserver_registry, cluster pins are not ready until every
+// live tserver has heartbeated at least once.
+TEST_F(MasterTest, YsqlDbPinsWaitForAllLiveTserversAfterRestart) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_persist_tserver_registry) = true;
+  const std::string kTs1 = "ts-pins-1", kTs2 = "ts-pins-2";
+  ASSERT_RESULT(SendNewTSRegistrationHeartbeat(kTs1, 1));
+  ASSERT_RESULT(SendNewTSRegistrationHeartbeat(kTs2, 1));
+
+  // Reload the persisted tserver registry into fresh descriptors. Their per-leader-term pin
+  // heartbeat markers are intentionally not persisted.
+  ASSERT_OK(mini_master_->Restart(true));
+
+  auto resp = ASSERT_RESULT(SendYsqlDbOldestPinnedReadTimesHeartbeat(
+      kTs1, 1, {{1001, HybridTime(100)}}));
+  EXPECT_FALSE(resp.cluster_ysql_db_pins_ready());
+
+  resp = ASSERT_RESULT(SendYsqlDbOldestPinnedReadTimesHeartbeat(
+      kTs2, 1, {{1001, HybridTime(50)}}));
+  EXPECT_TRUE(resp.cluster_ysql_db_pins_ready());
+  ASSERT_EQ(resp.cluster_ysql_db_oldest_pinned_read_times().at(1001).db_level_oldest_read_time(),
+            HybridTime(50).ToPB());
+}
+
 // The response carries the global min per db across all live tservers.
 // When a ts clears its pin via an empty heartbeat, the cluster min rises to the remaining ts.
 TEST_F(MasterTest, YsqlDbOldestPinnedReadTimesGlobalMin) {
