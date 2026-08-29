@@ -421,6 +421,15 @@ static const struct config_enum_entry track_options[] =
 #define YB_HDR_DEFAULT_MAX_VALUE YB_HDR_DEFAULT_MAX_LATENCY_MS / YB_HDR_DEFAULT_LATENCY_RES_MS
 #define YB_DEFAULT_QTEXT_LIMIT_KB -1
 
+/*
+ * YB: Default maximum length (in bytes) for a single query entry stored in
+ * pg_stat_statements.  This caps the text stored per entry to prevent large
+ * binary literals that escaped normalization from being retained verbatim.
+ * A properly normalized query is always short, so this limit does not affect
+ * normal operation.  Set to -1 to disable the limit.
+ */
+#define YB_DEFAULT_PGSS_QUERY_MAX_LEN 4096
+
 static int	pgss_max;			/* max # statements to track */
 static int	pgss_track;			/* tracking level */
 static bool pgss_track_utility; /* whether to track utility commands */
@@ -440,6 +449,7 @@ static int64_t yb_hdr_max_value = YB_HDR_DEFAULT_MAX_VALUE; /* default hardcode 
 															 * latency_res */
 static struct hdr_histogram_bucket_config cfg;
 static int	yb_qtext_size_limit = YB_DEFAULT_QTEXT_LIMIT_KB;
+static int	yb_pgss_query_max_len = YB_DEFAULT_PGSS_QUERY_MAX_LEN;
 
 /*
  * yb_hdr_max_value is the integer representation of the max query latency we
@@ -666,6 +676,25 @@ _PG_init(void)
 							MAX_KILOBYTES,
 							PGC_SUSET,
 							GUC_UNIT_KB,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_stat_statements.yb_query_text_max_length",
+							"Sets the maximum length in bytes of query text stored per entry "
+							"in pg_stat_statements.",
+							"Queries whose text (after normalization) exceeds this limit are "
+							"truncated and appended with '...'.  This prevents large binary "
+							"literals that escaped normalization from being retained verbatim, "
+							"protecting sensitive data such as PII.  A properly normalized "
+							"query is always short, so this limit does not affect normal "
+							"operation under expected conditions.  Set to -1 to disable.",
+							&yb_pgss_query_max_len,
+							YB_DEFAULT_PGSS_QUERY_MAX_LEN,
+							-1,
+							INT_MAX,
+							PGC_SUSET,
+							0,
 							NULL,
 							NULL,
 							NULL);
@@ -1999,6 +2028,39 @@ pgss_store(const char *query, uint64 queryId,
 			 * with proper normalization on the next full parse cycle.
 			 */
 			goto done;
+		}
+
+		/*
+		 * YB: Truncate query text if it exceeds the per-entry size limit.
+		 *
+		 * This provides defense-in-depth protection against sensitive data
+		 * (e.g., PII, large binary literals) being stored verbatim in PGSS.
+		 * It handles two main cases:
+		 *   1. DML statements where normalization was bypassed or failed for
+		 *      a very large query (e.g., INSERT with a huge bytea literal).
+		 *      A properly normalized query is always short, so truncation
+		 *      will not affect correctly processed queries.
+		 *   2. Utility statements (CALL, DO, SET, COPY, etc.) which are
+		 *      always stored as raw text with only password redaction.
+		 *
+		 * The truncated text is suffixed with "..." to indicate truncation.
+		 */
+		if (yb_pgss_query_max_len > 0 && query_len > yb_pgss_query_max_len)
+		{
+			const char *src = norm_query ? norm_query : query;
+			char	   *truncated = (char *) palloc(yb_pgss_query_max_len + 1);
+			int			suffix_start;
+
+			/* Reserve the last 3 bytes for the "..." truncation marker */
+			suffix_start = Max(yb_pgss_query_max_len - 3, 0);
+			memcpy(truncated, src, suffix_start);
+			memcpy(truncated + suffix_start, "...", yb_pgss_query_max_len - suffix_start);
+			truncated[yb_pgss_query_max_len] = '\0';
+
+			if (norm_query)
+				pfree(norm_query);
+			norm_query = truncated;
+			query_len = yb_pgss_query_max_len;
 		}
 
 		/* Append new query text to file with only shared lock held */
