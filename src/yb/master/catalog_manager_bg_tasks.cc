@@ -77,6 +77,11 @@ DEFINE_validator(transaction_table_check_interval_sec, FLAG_GT_VALUE_VALIDATOR(0
 DEFINE_RUNTIME_bool(autoscale_transaction_tables, true,
     "Automatically scale transaction status tables based on the number of live tservers.");
 
+DEFINE_RUNTIME_uint32(ysql_db_history_retention_pin_refresh_interval_secs, 60,
+  "How often a master that is not the leader re-reads the ysql catalog history retention pins "
+  "the leader published to the sys catalog. Reading them scans the sys catalog, while a stale "
+  "copy only makes such a master retain catalog history for longer than needed.");
+
 DEFINE_RUNTIME_int32(load_balancer_initial_delay_secs, yb::master::kDelayAfterFailoverSecs,
              "Amount of time to wait between becoming master leader and enabling the load "
              "balancer.");
@@ -316,6 +321,23 @@ void CatalogManagerBgTasks::RunOnceAsLeader(const LeaderEpoch& epoch) {
   if (FLAGS_autoscale_transaction_tables) {
     ScaleUpTransactionStatusTablesIfNeeded(epoch);
   }
+
+  WARN_NOT_OK(
+      catalog_manager_->PersistYsqlHistoryRetentionPin(epoch),
+      "Failed to publish the ysql catalog history retention pin");
+}
+
+void CatalogManagerBgTasks::RefreshYsqlHistoryRetentionPinIfNeeded() {
+  auto now = CoarseMonoClock::Now();
+  if ((now - last_ysql_db_history_retention_pin_refresh_time_) <
+      std::chrono::seconds(FLAGS_ysql_db_history_retention_pin_refresh_interval_secs)) {
+    return;  // Not time yet
+  }
+  last_ysql_db_history_retention_pin_refresh_time_ = now;
+
+  WARN_NOT_OK(
+      catalog_manager_->RefreshYsqlHistoryRetentionPin(),
+      "Failed to refresh the ysql catalog history retention pin");
 }
 
 void CatalogManagerBgTasks::MaybeRunClusterBalancer(
@@ -350,6 +372,7 @@ void CatalogManagerBgTasks::Run() {
         master_->ysql_backends_manager()->AbortAllJobs();
         was_leader_ = false;
       }
+      RefreshYsqlHistoryRetentionPinIfNeeded();
     }
     // Wait for a notification or a timeout expiration.
     //  - CreateTable will call Wake() to notify about the tablets to add

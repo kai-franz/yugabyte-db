@@ -80,6 +80,8 @@ class CatalogManagerBgTasks final {
       const LeaderEpoch& epoch, const std::vector<TableInfoPtr>& tables,
       const TabletInfoMap& tablets);
 
+  void RefreshYsqlHistoryRetentionPinIfNeeded();
+
   void ScaleUpTransactionStatusTablesIfNeeded(const LeaderEpoch& epoch);
   Status DoScaleUpTransactionStatusTables(
       size_t num_live_tservers, const LeaderEpoch& epoch);
@@ -102,6 +104,7 @@ class CatalogManagerBgTasks final {
   scoped_refptr<EventStats> cluster_balancer_duration_;
   CoarseTimePoint last_transaction_status_check_time_;
   size_t last_live_tservers_;
+  CoarseTimePoint last_ysql_db_history_retention_pin_refresh_time_;
 };
 
 }  // namespace master
