@@ -20,5 +20,6 @@
 Datum
 pgsql_version(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_TEXT_P(cstring_to_text(PG_VERSION_STR));
+	/* YB: rebuild-check-1949 marker so incremental postgres rebuilds are queryable. */
+	PG_RETURN_TEXT_P(cstring_to_text(PG_VERSION_STR " [rebuild-check-1949]"));
 }
