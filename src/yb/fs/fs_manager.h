@@ -119,6 +119,8 @@ struct FsManagerOpts {
 // The current top-level dir layout is <yb.root.dir>/yb-data/<server>/. Subdirs under it are:
 //     logs/
 //     instance
+//     auto_flags_config
+//     ysql_db_history_retention_pins
 //     wals/<table>/<tablet>
 //     tablet-meta/<tablet>
 //     data/rocksdb/<table>/<tablet>/
@@ -280,6 +282,9 @@ class FsManager {
 
   // Return the directory where the certs are stored.
   std::string GetDefaultRootDir() const;
+
+  // Return the path where YsqlDbHistoryRetentionPinsPB is stored. The file need not exist.
+  std::string GetYsqlDbHistoryRetentionPinsPath() const;
 
   std::vector<std::string> GetConsensusMetadataDirs() const;
   // Return the directory where the consensus metadata is stored.
