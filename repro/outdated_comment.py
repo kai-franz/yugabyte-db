@@ -1,8 +1,5 @@
 def compute_total(items):
-    total = 0
-    for item in items:
-        total = total + item.price * item.qty
-    return total
+    return sum(item.price * item.qty for item in items)
 
 
 def describe(items):
