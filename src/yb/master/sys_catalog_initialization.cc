@@ -49,6 +49,8 @@ TAG_FLAG(create_initial_sys_catalog_snapshot, hidden);
 DEFINE_test_flag(bool, fail_initdb_after_snapshot_restore, false,
                  "Kill the master process after successfully restoring the sys catalog snapshot.");
 
+DECLARE_bool(batch_ysql_system_tables_metadata);
+DECLARE_uint64(consensus_max_batch_size_bytes);
 DECLARE_bool(enable_ysql);
 
 using yb::tserver::TabletSnapshotOpResponsePB;
@@ -65,6 +67,66 @@ const char* kSysCatalogSnapshotRocksDbSubDir = "rocksdb";
 const char* kSysCatalogSnapshotTabletMetadataChangesFile =
     "exported_tablet_metadata_changes";
 const char* kUseInitialSysCatalogSnapshotEnvVar = "YB_USE_INITIAL_SYS_CATALOG_SNAPSHOT";
+
+// True if the change only adds one table to the sys catalog tablet, so it can be folded into an
+// ADD_MULTIPLE_TABLES operation without changing what gets applied.
+bool IsSysCatalogAddTableOnly(const tablet::ChangeMetadataRequestPB& change) {
+  if (!change.has_add_table() || change.tablet_id() != kSysCatalogTabletId) {
+    return false;
+  }
+  auto other_fields = change;
+  other_fields.clear_tablet_id();
+  other_fields.clear_add_table();
+  return other_fields.ByteSizeLong() == 0;
+}
+
+// Every ADD_TABLE operation rewrites and fsyncs the whole sys catalog superblock, which grows with
+// each table, so replaying the initdb changes one by one takes seconds at cluster creation (more
+// with several masters, since each operation is also a Raft round trip). Runs of ADD_TABLE changes
+// are replayed as ADD_MULTIPLE_TABLES operations instead, which flush the superblock once each.
+// Returns the number of operations replicated.
+Result<size_t> ReplayTabletMetadataChanges(
+    const tserver::ExportedTabletMetadataChanges& changes,
+    tablet::TabletPeer* sys_catalog_tablet_peer,
+    int64_t term) {
+  size_t num_operations = 0;
+  auto replicate = [&](const tablet::ChangeMetadataRequestPB& req) {
+    ++num_operations;
+    return tablet::SyncReplicateChangeMetadataOperation(&req, sys_catalog_tablet_peer, term);
+  };
+
+  // Keep each operation well within a single Raft batch.
+  const size_t max_batch_bytes = FLAGS_consensus_max_batch_size_bytes / 2;
+  tablet::ChangeMetadataRequestPB batch;
+  batch.set_tablet_id(kSysCatalogTabletId);
+  size_t batch_bytes = 0;
+  auto flush_batch = [&]() -> Status {
+    if (batch.add_multiple_tables().empty()) {
+      return Status::OK();
+    }
+    RETURN_NOT_OK(replicate(batch));
+    batch.clear_add_multiple_tables();
+    batch_bytes = 0;
+    return Status::OK();
+  };
+
+  for (const auto& change : changes.metadata_changes()) {
+    if (!FLAGS_batch_ysql_system_tables_metadata || !IsSysCatalogAddTableOnly(change)) {
+      RETURN_NOT_OK(flush_batch());
+      RETURN_NOT_OK(replicate(change));
+      continue;
+    }
+    const auto table_bytes = change.add_table().ByteSizeLong();
+    if (batch_bytes > 0 && batch_bytes + table_bytes > max_batch_bytes) {
+      RETURN_NOT_OK(flush_batch());
+    }
+    *batch.add_add_multiple_tables() = change.add_table();
+    batch_bytes += table_bytes;
+  }
+  RETURN_NOT_OK(flush_batch());
+  return num_operations;
+}
+
 }  // anonymous namespace
 
 // ------------------------------------------------------------------------------------------------
@@ -148,14 +210,10 @@ Status RestoreInitialSysCatalogSnapshot(
       Env::Default(),
       JoinPathSegments(initial_snapshot_path, kSysCatalogSnapshotTabletMetadataChangesFile),
       &tablet_metadata_changes));
-  for (const auto& change_metadata_req : tablet_metadata_changes.metadata_changes()) {
-    RETURN_NOT_OK(tablet::SyncReplicateChangeMetadataOperation(
-        &change_metadata_req,
-        sys_catalog_tablet_peer,
-        term));
-  }
+  const auto num_operations = VERIFY_RESULT(ReplayTabletMetadataChanges(
+      tablet_metadata_changes, sys_catalog_tablet_peer, term));
   LOG(INFO) << "Imported " << tablet_metadata_changes.metadata_changes_size()
-            << " tablet metadata changes";
+            << " tablet metadata changes using " << num_operations << " operations";
 
   latch.Wait();
   return Status::OK();

@@ -521,7 +521,8 @@ DECLARE_string(tmp_dir);
 
 DEFINE_RUNTIME_bool(batch_ysql_system_tables_metadata, true,
     "Whether change metadata operation and SysCatalogTable upserts for ysql system tables during a "
-    "create database is performed one by one or batched together");
+    "create database, and the change metadata operations replayed when restoring the initial sys "
+    "catalog snapshot, are performed one by one or batched together");
 
 DEFINE_test_flag(bool, keep_docdb_table_on_ysql_drop_table, false,
     "When enabled does not delete tables from the docdb layer, resulting in YSQL "
