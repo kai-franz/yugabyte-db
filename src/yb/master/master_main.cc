@@ -81,6 +81,7 @@ DECLARE_int32(remote_bootstrap_max_chunk_size);
 DECLARE_bool(use_docdb_aware_bloom_filter);
 DECLARE_int32(follower_unavailable_considered_failed_sec);
 DECLARE_int32(log_min_seconds_to_retain);
+DECLARE_bool(quick_leader_election_on_create);
 
 using namespace std::literals;
 
@@ -120,6 +121,11 @@ static int MasterMain(int argc, char** argv) {
 
   FLAGS_follower_unavailable_considered_failed_sec = 2 * MonoTime::kSecondsPerHour;
   FLAGS_log_min_seconds_to_retain = 2 * MonoTime::kSecondsPerHour;
+
+  // The sys catalog is the only Raft group on a master and, unlike user tablets, nobody sends it a
+  // leader hint, so a new universe would otherwise wait a full leader failure timeout (3s by
+  // default) before its first election. This only affects Raft groups still at term 0.
+  FLAGS_quick_leader_election_on_create = true;
 
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(
       MasterTServerParseFlagsAndInit(MasterOptions::kServerType, /*is_master=*/true, &argc, &argv));
