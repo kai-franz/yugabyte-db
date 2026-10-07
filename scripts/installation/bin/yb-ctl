@@ -105,7 +105,7 @@ YEDIS_DEFAULT_PORT = 6379
 
 LOCALHOST_IP = '127.0.0.1'
 
-SLEEP_TIME_IN_SEC = 1
+SLEEP_TIME_IN_SEC = 0.2
 MAX_YB_ADMIN_WAIT_SEC = 45
 MAX_WAIT_FOR_PROCESSES_RUNNING_SEC = 10
 DEFAULT_REPLICATION_FACTOR = 1
@@ -1702,6 +1702,40 @@ class ClusterControl:
                 num_alive_ts, num_yb_admin_ts))
             return False
 
+        return self.wait_for_ysql()
+
+    def wait_for_ysql(self):
+        """
+        Waits until YSQL accepts connections on every running tserver, so that clients can connect
+        as soon as the command returns.
+        """
+        overridden_flags = {item.split("=", 1)[0] for item in self.options.tserver_flags}
+        if not self.is_ysql_enabled() or overridden_flags & {
+                "enable_ysql", "start_pgsql_proxy", "pgsql_proxy_bind_address"}:
+            # Either there is no YSQL, or yb-ctl can't tell whether or where postgres listens.
+            return True
+        try:
+            pg_isready = self.options.get_binary_path("pg_isready")
+        except RuntimeError:
+            logging.info("pg_isready not found, not waiting for YSQL to accept connections.")
+            return True
+
+        ysql_port = str(self.options.get_client_protocol_port(PROTOCOL_TYPE_YSQL))
+        hosts = [
+            self.options.get_client_advertise_host_port(DaemonId(DAEMON_TYPE_TSERVER, i))
+            for i in range(1, self.get_number_of_servers(DAEMON_TYPE_TSERVER) + 1)
+            if self.get_pid(DaemonId(DAEMON_TYPE_TSERVER, i)) is not None]
+
+        def call_check_for_ysql(should_get_error):
+            for host in hosts:
+                call_get_output_maybe_error(
+                    [pg_isready, "-q", "-h", host, "-p", ysql_port], should_get_error)
+            return True
+
+        logging.info("Waiting for YSQL to accept connections on {}.".format(hosts))
+        if not retry_call_with_timeout(call_check_for_ysql, self.options.timeout_yb_admin_sec):
+            logging.error("Failed waiting for YSQL to accept connections on {}".format(hosts))
+            return False
         return True
 
     def wait_for_cluster_or_raise(self):
