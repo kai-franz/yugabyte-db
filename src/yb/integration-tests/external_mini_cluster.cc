@@ -1317,10 +1317,13 @@ Status ExternalMiniCluster::StartMasters() {
   // TEST_master_min_live_tservers_before_initdb does not deadlock against tservers that
   // haven't been started yet. See the comment block in Start() for details.
 
-  // Trigger an election to avoid an unnecessary 3s wait on every cluster startup.
+  // Trigger an election to avoid an unnecessary 3s wait on every cluster startup. It is an initial
+  // election so that it can't depose a leader the masters already elected on their own.
   if (!masters_.empty()) {
     WARN_NOT_OK(WaitForMastersToCommitUpTo(0), "Masters did not commit opid 0 in time");
-    WARN_NOT_OK(StartElection(RandomElement(masters_).get()), "Could not start election");
+    WARN_NOT_OK(
+        StartElection(RandomElement(masters_).get(), InitialElection::kTrue),
+        "Could not start election");
   }
 
   return Status::OK();
@@ -2296,13 +2299,15 @@ uint16_t ExternalMiniCluster::AllocateFreePort() {
   return GetFreePort(&free_port_file_locks_.back());
 }
 
-Status ExternalMiniCluster::StartElection(ExternalMaster* master) {
+Status ExternalMiniCluster::StartElection(
+    ExternalMaster* master, InitialElection initial_election) {
   auto master_sock = master->bound_rpc_addr();
   auto master_proxy = std::make_shared<ConsensusServiceProxy>(proxy_cache_.get(), master_sock);
 
   RunLeaderElectionRequestPB req;
   req.set_dest_uuid(master->uuid());
   req.set_tablet_id(yb::master::kSysCatalogTabletId);
+  req.set_initial_election(initial_election);
   RunLeaderElectionResponsePB resp;
   RpcController rpc;
   rpc.set_timeout(opts_.timeout);

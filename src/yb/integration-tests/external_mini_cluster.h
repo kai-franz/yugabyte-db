@@ -250,6 +250,7 @@ struct ExternalMiniClusterOptions {
 };
 
 YB_STRONGLY_TYPED_BOOL(RequireExitCode0);
+YB_STRONGLY_TYPED_BOOL(InitialElection);
 
 class LogWaiter;
 
@@ -597,8 +598,10 @@ class ExternalMiniCluster : public MiniClusterBase {
     return opts_.timeout;
   }
 
-  // Start a leader election on this master.
-  Status StartElection(ExternalMaster* master);
+  // Start a leader election on this master. An initial election is skipped if the sys catalog has
+  // already elected a leader.
+  Status StartElection(
+      ExternalMaster* master, InitialElection initial_election = InitialElection::kFalse);
 
   bool running() const { return running_; }
 
