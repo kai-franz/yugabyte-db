@@ -13,6 +13,12 @@
 
 #include "yb/master/sys_catalog_initialization.h"
 
+#include <algorithm>
+#include <vector>
+
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/message.h>
+
 #include "yb/ash/wait_state.h"
 
 #include "yb/common/wire_protocol.h"
@@ -65,6 +71,64 @@ const char* kSysCatalogSnapshotRocksDbSubDir = "rocksdb";
 const char* kSysCatalogSnapshotTabletMetadataChangesFile =
     "exported_tablet_metadata_changes";
 const char* kUseInitialSysCatalogSnapshotEnvVar = "YB_USE_INITIAL_SYS_CATALOG_SNAPSHOT";
+
+// True if the request only adds one table, so merging it into add_multiple_tables of another
+// request does not change what gets applied.
+bool IsMergeableAddTable(const tablet::ChangeMetadataRequestPB& req) {
+  if (!req.has_add_table()) {
+    return false;
+  }
+  std::vector<const google::protobuf::FieldDescriptor*> fields;
+  req.GetReflection()->ListFields(req, &fields);
+  return std::all_of(fields.begin(), fields.end(), [](const auto* field) {
+    return field->number() == tablet::ChangeMetadataRequestPB::kTabletIdFieldNumber ||
+           field->number() == tablet::ChangeMetadataRequestPB::kAddTableFieldNumber;
+  });
+}
+
+// Initdb records one add_table change per catalog table (~600). Applying a change rewrites the
+// whole sys catalog superblock on every master, and a follower applies each change before it
+// acknowledges the next one. Replicating the changes one at a time is therefore quadratic in the
+// number of tables, and with several masters every change also waits for a follower's rewrite and
+// a round trip. Consecutive add_table changes are merged into one add_multiple_tables change.
+Status ReplicateTabletMetadataChanges(
+    tserver::ExportedTabletMetadataChanges* changes, tablet::TabletPeer* sys_catalog_tablet_peer,
+    int64_t term) {
+  size_t num_operations = 0;
+  auto replicate = [&](const tablet::ChangeMetadataRequestPB& req) {
+    ++num_operations;
+    return tablet::SyncReplicateChangeMetadataOperation(&req, sys_catalog_tablet_peer, term);
+  };
+
+  tablet::ChangeMetadataRequestPB batch;
+  auto replicate_batch = [&]() -> Status {
+    if (batch.add_multiple_tables().empty()) {
+      return Status::OK();
+    }
+    RETURN_NOT_OK(replicate(batch));
+    batch.Clear();
+    return Status::OK();
+  };
+
+  for (auto& change : *changes->mutable_metadata_changes()) {
+    const bool mergeable = IsMergeableAddTable(change);
+    if (!mergeable || batch.tablet_id() != change.tablet_id()) {
+      RETURN_NOT_OK(replicate_batch());
+    }
+    if (!mergeable) {
+      RETURN_NOT_OK(replicate(change));
+      continue;
+    }
+    batch.set_tablet_id(change.tablet_id());
+    batch.add_add_multiple_tables()->Swap(change.mutable_add_table());
+  }
+  RETURN_NOT_OK(replicate_batch());
+
+  LOG(INFO) << "Imported " << changes->metadata_changes_size() << " tablet metadata changes in "
+            << num_operations << " operations";
+  return Status::OK();
+}
+
 }  // anonymous namespace
 
 // ------------------------------------------------------------------------------------------------
@@ -148,14 +212,8 @@ Status RestoreInitialSysCatalogSnapshot(
       Env::Default(),
       JoinPathSegments(initial_snapshot_path, kSysCatalogSnapshotTabletMetadataChangesFile),
       &tablet_metadata_changes));
-  for (const auto& change_metadata_req : tablet_metadata_changes.metadata_changes()) {
-    RETURN_NOT_OK(tablet::SyncReplicateChangeMetadataOperation(
-        &change_metadata_req,
-        sys_catalog_tablet_peer,
-        term));
-  }
-  LOG(INFO) << "Imported " << tablet_metadata_changes.metadata_changes_size()
-            << " tablet metadata changes";
+  RETURN_NOT_OK(
+      ReplicateTabletMetadataChanges(&tablet_metadata_changes, sys_catalog_tablet_peer, term));
 
   latch.Wait();
   return Status::OK();
