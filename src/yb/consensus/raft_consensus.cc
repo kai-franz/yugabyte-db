@@ -585,9 +585,16 @@ Status RaftConsensus::Start(const ConsensusBootstrapInfo& info) {
         // more likely to fail due to uninitialized peers or conflicting elections, which could
         // have unforseen consequences.
         if (FLAGS_quick_leader_election_on_create) {
-          initial_delta = (state_->GetCommittedConfigUnlocked().peers_size() == 1) ?
-              MonoDelta::kZero :
-              MonoDelta::FromMilliseconds(rng_.Uniform(FLAGS_raft_heartbeat_interval_ms));
+          const auto& config = state_->GetCommittedConfigUnlocked();
+          if (config.peers_size() == 1) {
+            initial_delta = MonoDelta::kZero;
+          } else if (config.peers(0).permanent_uuid() == state_->GetPeerUuid()) {
+            // Only one peer elects early. Peers firing within a few ms of each other can each win
+            // a pre-election, and the loser's real election then makes the new leader step down,
+            // which costs a full failure timeout plus a leader lease before the next leader.
+            initial_delta = MonoDelta::FromMilliseconds(
+                rng_.Uniform(FLAGS_raft_heartbeat_interval_ms));
+          }
         }
       }
     }
