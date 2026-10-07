@@ -48,6 +48,7 @@ DEFINE_test_flag(double, tserver_ysql_lease_refresh_failure_prob, 0.0,
     "Probablity to pretend we got a failure in response to a lease refresh RPC.");
 
 DECLARE_bool(enable_object_locking_for_table_locks);
+DECLARE_int32(heartbeat_max_failures_before_backoff);
 
 namespace yb {
 namespace tserver {
@@ -68,10 +69,14 @@ class YsqlLeasePoller : public MasterLeaderPollerInterface {
   std::future<Status> RelinquishLease(MonoDelta timeout) const;
 
  private:
+  Status RefreshLease();
+
   TabletServer& server_;
   YsqlLeaderClientListener listener_;
   MasterLeaderFinder& finder_;
   std::optional<master::MasterYsqlLeaseProxy> proxy_;
+  // Only accessed from the poll scheduler thread.
+  bool polled_successfully_ = false;
 };
 
 class YsqlLeaseClient::Impl {
@@ -155,6 +160,12 @@ YsqlLeasePoller::YsqlLeasePoller(
     : server_(server), listener_(listener), finder_(finder) {}
 
 Status YsqlLeasePoller::Poll() {
+  RETURN_NOT_OK(RefreshLease());
+  polled_successfully_ = true;
+  return Status::OK();
+}
+
+Status YsqlLeasePoller::RefreshLease() {
   if (!FLAGS_TEST_tserver_enable_ysql_lease_refresh || !IsYsqlLeaseEnabled()) {
     return Status::OK();
   }
@@ -187,6 +198,13 @@ Status YsqlLeasePoller::Poll() {
 }
 
 MonoDelta YsqlLeasePoller::IntervalToNextPoll(int32_t consecutive_failures) {
+  // Postgres stays paused until this tserver holds a lease, so ask for the first one right away
+  // rather than a full refresh interval after startup. The master rejects the request until the
+  // heartbeater has registered this tserver, so retry promptly a few times before backing off.
+  if (!polled_successfully_ &&
+      consecutive_failures <= FLAGS_heartbeat_max_failures_before_backoff) {
+    return consecutive_failures == 0 ? MonoDelta::kZero : MonoDelta::FromMilliseconds(100);
+  }
   return MonoDelta::FromMilliseconds(FLAGS_ysql_lease_refresher_interval_ms);
 }
 
