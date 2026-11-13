@@ -204,15 +204,17 @@ void ReleaseAll() {
   MallocExtension::ReleaseMemoryToSystem(std::numeric_limits<size_t>::max());
 }
 
-// Same as MemTracker::GcTcmallocIfNeeded.
-void GcLoop() {
+// Same as MemTracker::GcTcmallocIfNeeded. Returns how many bytes it set out to release.
+int64_t GcLoop() {
   int64_t free_bytes = GetProperty("tcmalloc.pageheap_free_bytes");
   int64_t allocated_bytes = GetProperty("generic.current_allocated_bytes");
   int64_t extra = free_bytes - allocated_bytes * kGcMaxFreePercentage / 100;
+  const int64_t target = std::max<int64_t>(extra, 0);
   while (extra > 0) {
     MallocExtension::ReleaseMemoryToSystem(1_MB);
     extra -= 1_MB;
   }
+  return target;
 }
 
 // Runs TCMalloc's ProcessBackgroundActions loop on its own thread, set up the way yb-tserver sets
@@ -247,6 +249,8 @@ class BackgroundThread {
   ThreadPtr thread_;
 };
 
+int64_t last_gc_target_bytes = 0;
+
 // Releases free memory under the given policy and returns how long that took. For
 // kBackgroundThread, runs the background thread until it has released expected_bytes (or more
 // than enough time has passed for that).
@@ -254,7 +258,7 @@ int64_t ReleaseWithPolicy(ReleasePolicy policy, size_t expected_bytes) {
   auto start = NowNs();
   switch (policy) {
     case ReleasePolicy::kGcLoop:
-      GcLoop();
+      last_gc_target_bytes = GcLoop();
       break;
     case ReleasePolicy::kOneCall:
       MallocExtension::ReleaseMemoryToSystem(std::numeric_limits<size_t>::max());
@@ -404,29 +408,24 @@ void ReadAllocatedBytes() {
   benchmark::DoNotOptimize(GetProperty("generic.current_allocated_bytes"));
 }
 
-// An allocation too big for the per-CPU and thread caches goes to the page heap under
-// pageheap_lock. 4 MiB is a whole number of hugepages, so it never lands in the holes.
-void AllocateFromPageHeap() {
-  void* p = malloc(4_MB);
-  benchmark::DoNotOptimize(p);
-  free(p);
-}
-
 constexpr auto kProbeInterval = std::chrono::microseconds(50);
 
 // Args: hugepages, hole_pages, policy. Half of each hugepage is freed in holes of hole_pages
 // pages, long enough ago that skip-subrelease no longer protects them, then released under the
-// policy. Time is how long the release took; *_wait_max_ms is the longest a probe thread waited
-// for pageheap_lock meanwhile.
+// policy. Time is how long the release took; lock_wait_max_ms is the longest a probe thread waited
+// for pageheap_lock meanwhile. (A probe that allocated from the page heap would distort the
+// result: each 4 MiB block it frees goes to the hugepage cache, which a release empties first, so
+// with a lock that lets the probe in, small releases kept unbacking that block instead of the
+// holes.)
 void BM_ReleaseHoleyHugepages(benchmark::State& state) {
   const size_t hugepages = state.range(0);
   const size_t hole_pages = state.range(1);
   const auto policy = static_cast<ReleasePolicy>(state.range(2));
 
   ScopedSkipSubrelease zero_skip_subrelease;
-  double stats_wait_max_ms = 0;
-  double alloc_wait_max_ms = 0;
+  double lock_wait_max_ms = 0;
   double released_mib = 0;
+  double gc_target_mib = 0;
   size_t holes = 0;
   int64_t total_release_ns = 0;
   for (auto _ : state) {
@@ -434,18 +433,16 @@ void BM_ReleaseHoleyHugepages(benchmark::State& state) {
     holes = heap.holes();
     auto unmapped_before = UnmappedBytes();
 
-    Prober stats_prober(ReadAllocatedBytes, kProbeInterval);
-    Prober alloc_prober(AllocateFromPageHeap, kProbeInterval);
+    Prober prober(ReadAllocatedBytes, kProbeInterval);
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     auto release_start = NowNs();
     auto release_ns = ReleaseWithPolicy(policy, heap.hole_bytes());
     auto release_end = release_start + release_ns;
-    stats_wait_max_ms = std::max(
-        stats_wait_max_ms, MaxOverlappingMs(stats_prober.Stop(), release_start, release_end));
-    alloc_wait_max_ms = std::max(
-        alloc_wait_max_ms, MaxOverlappingMs(alloc_prober.Stop(), release_start, release_end));
+    lock_wait_max_ms = std::max(
+        lock_wait_max_ms, MaxOverlappingMs(prober.Stop(), release_start, release_end));
 
     released_mib += BytesToMiB(UnmappedBytes() - unmapped_before);
+    gc_target_mib += BytesToMiB(last_gc_target_bytes);
     total_release_ns += release_ns;
     state.SetIterationTime(release_ns / 1e9);
   }
@@ -453,9 +450,11 @@ void BM_ReleaseHoleyHugepages(benchmark::State& state) {
   const auto iterations = static_cast<double>(state.iterations());
   state.counters["holes"] = holes;
   state.counters["released_mib"] = released_mib / iterations;
+  if (policy == ReleasePolicy::kGcLoop) {
+    state.counters["gc_target_mib"] = gc_target_mib / iterations;
+  }
   state.counters["us_per_released_mib"] = total_release_ns / 1e3 / std::max(released_mib, 1.0);
-  state.counters["stats_wait_max_ms"] = stats_wait_max_ms;
-  state.counters["alloc_wait_max_ms"] = alloc_wait_max_ms;
+  state.counters["lock_wait_max_ms"] = lock_wait_max_ms;
   SetLabel(state);
 }
 
