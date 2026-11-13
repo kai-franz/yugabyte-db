@@ -22,16 +22,20 @@
 //   release, and so stall threads that only need their lock and never allocate.
 // - BM_ReuseAfterRelease: what it costs to fault memory back in when it is allocated again 100 ms
 //   after it was freed and released.
-// - BM_BackgroundReleaseChurn: the same cost when TCMalloc's background thread releases memory at a
-//   fixed rate while the process keeps freeing and reallocating it.
+// - BM_ReleaseChurn: the same cost while the process keeps freeing and reallocating memory and
+//   the server's release policy runs.
+//
+// Each benchmark takes the release policy as an argument (see ReleasePolicy): the MemTracker GC
+// loop that yb-tserver runs today, or TCMalloc's background thread as configured by
+// --tcmalloc_background_thread. Together with builds that link different TCMalloc versions, that
+// covers every combination of the two.
 //
 // Build and run (use a release build). Run each benchmark in its own process: they reshape the
 // process-wide heap, so one benchmark's leftovers would change the next one's results.
 //   ./yb_build.sh release --cxx-benchmark tcmalloc-benchmark \
 //       --benchmark-args '--benchmark_filter=BM_ReleaseHoleyHugepages'
 //
-// To compare two TCMalloc versions, run the same benchmark in builds that link each of them. The
-// label shows whether per-CPU caches are active, the transparent hugepage mode, and TCMalloc's
+// The label shows whether per-CPU caches are active, the transparent hugepage mode, and TCMalloc's
 // skip-subrelease intervals, all of which change the results.
 
 #include <sys/resource.h>
@@ -62,6 +66,8 @@
 
 #if YB_GOOGLE_TCMALLOC
 
+#include <tcmalloc/internal/parameter_accessors.h>
+
 namespace yb {
 namespace {
 
@@ -74,6 +80,28 @@ constexpr size_t kTCMallocPageSize = 8_KB;
 constexpr size_t kHugePageSize = 2_MB;
 constexpr size_t kPagesPerHugePage = kHugePageSize / kTCMallocPageSize;
 constexpr size_t kOsPageSize = 4_KB;
+
+// Defaults of --tcmalloc_max_free_bytes_percentage, --mem_tracker_tcmalloc_gc_release_bytes (on a
+// server with more than 12.8 GB of memory), --tcmalloc_background_release_rate_bytes_per_sec and
+// --tcmalloc_skip_subrelease_{short,long}_interval_secs.
+constexpr int64_t kGcMaxFreePercentage = 10;
+constexpr size_t kGcReleaseBytes = 128_MB;
+constexpr size_t kBackgroundReleaseRate = 16_MB;
+constexpr auto kBackgroundSkipSubreleaseShort = absl::Seconds(60);
+constexpr auto kBackgroundSkipSubreleaseLong = absl::Seconds(300);
+
+// How the process returns free memory to the OS.
+enum class ReleasePolicy {
+  // MemTracker::GcTcmallocIfNeeded, which yb-tserver runs today in the thread that frees memory:
+  // release the free page heap memory above 10% of the allocated bytes, 1 MiB per call.
+  kGcLoop = 0,
+  // --tcmalloc_background_thread: TCMalloc's ProcessBackgroundActions releases
+  // kBackgroundReleaseRate bytes per second, without releasing extra pages from partially
+  // released hugepages, and the GC loop does not run.
+  kBackgroundThread = 1,
+  // Everything in one ReleaseMemoryToSystem call, for reference.
+  kOneCall = 2,
+};
 
 int64_t NowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -88,11 +116,12 @@ size_t GetProperty(const char* name) {
   return MallocExtension::GetNumericProperty(name).value_or(0);
 }
 
-// How much the page heap's unmapped memory grew since it was unmapped_before bytes.
-double UnmappedMiBSince(size_t unmapped_before) {
-  auto delta = static_cast<int64_t>(GetProperty("tcmalloc.pageheap_unmapped_bytes")) -
-               static_cast<int64_t>(unmapped_before);
-  return delta / static_cast<double>(1_MB);
+size_t UnmappedBytes() {
+  return GetProperty("tcmalloc.pageheap_unmapped_bytes");
+}
+
+double BytesToMiB(int64_t bytes) {
+  return bytes / static_cast<double>(1_MB);
 }
 
 std::string ThpMode() {
@@ -133,19 +162,22 @@ struct RusageDelta {
   rusage start_;
 };
 
-// Disables the skip-subrelease check, so that a release also returns memory that was in use a
-// moment ago, as releases with zero lookbacks do (and the old MemTracker GC loop did once the
-// freed memory was older than the lookbacks).
-class ScopedZeroSkipSubrelease {
+// Sets the skip-subrelease intervals, which keep free pages mapped while recent demand may need
+// them again, and restores the previous ones when destroyed. Zero intervals make a release also
+// return memory that was in use a moment ago, as if it had been free for longer than the
+// intervals.
+class ScopedSkipSubrelease {
  public:
-  ScopedZeroSkipSubrelease()
+  ScopedSkipSubrelease(absl::Duration short_interval, absl::Duration long_interval)
       : short_interval_(MallocExtension::GetSkipSubreleaseShortInterval()),
         long_interval_(MallocExtension::GetSkipSubreleaseLongInterval()) {
-    MallocExtension::SetSkipSubreleaseShortInterval(absl::ZeroDuration());
-    MallocExtension::SetSkipSubreleaseLongInterval(absl::ZeroDuration());
+    MallocExtension::SetSkipSubreleaseShortInterval(short_interval);
+    MallocExtension::SetSkipSubreleaseLongInterval(long_interval);
   }
 
-  ~ScopedZeroSkipSubrelease() {
+  ScopedSkipSubrelease() : ScopedSkipSubrelease(absl::ZeroDuration(), absl::ZeroDuration()) {}
+
+  ~ScopedSkipSubrelease() {
     MallocExtension::SetSkipSubreleaseShortInterval(short_interval_);
     MallocExtension::SetSkipSubreleaseLongInterval(long_interval_);
   }
@@ -167,20 +199,76 @@ void FlushFrontEndCaches() {
 }
 
 void ReleaseAll() {
-  ScopedZeroSkipSubrelease zero_skip_subrelease;
+  ScopedSkipSubrelease zero_skip_subrelease;
   FlushFrontEndCaches();
   MallocExtension::ReleaseMemoryToSystem(std::numeric_limits<size_t>::max());
 }
 
-// Releases all free memory in one call (chunk_bytes = 0), or bytes in calls of chunk_bytes each,
-// like MemTracker::GcTcmallocIfNeeded. Returns how long that took.
-int64_t Release(size_t bytes, size_t chunk_bytes) {
+// Same as MemTracker::GcTcmallocIfNeeded.
+void GcLoop() {
+  int64_t free_bytes = GetProperty("tcmalloc.pageheap_free_bytes");
+  int64_t allocated_bytes = GetProperty("generic.current_allocated_bytes");
+  int64_t extra = free_bytes - allocated_bytes * kGcMaxFreePercentage / 100;
+  while (extra > 0) {
+    MallocExtension::ReleaseMemoryToSystem(1_MB);
+    extra -= 1_MB;
+  }
+}
+
+// Runs TCMalloc's ProcessBackgroundActions loop on its own thread, set up the way yb-tserver sets
+// it up with --tcmalloc_background_thread, until destroyed. It wakes up about once a second.
+class BackgroundThread {
+ public:
+  explicit BackgroundThread(size_t release_bytes_per_sec)
+      : old_rate_(MallocExtension::GetBackgroundReleaseRate()) {
+    MallocExtension::SetBackgroundReleaseRate(
+        MallocExtension::BytesPerSecond{release_bytes_per_sec});
+    SetReleasePartialAllocPages(false);
+    MallocExtension::SetBackgroundProcessActionsEnabled(true);
+    thread_ = CHECK_RESULT(Thread::Make(
+        "tcmalloc", "tcmalloc_bkgrnd", [] { MallocExtension::ProcessBackgroundActions(); }));
+  }
+
+  ~BackgroundThread() {
+    MallocExtension::SetBackgroundProcessActionsEnabled(false);
+    thread_->Join();
+    SetReleasePartialAllocPages(true);
+    MallocExtension::SetBackgroundReleaseRate(old_rate_);
+  }
+
+ private:
+  static void SetReleasePartialAllocPages(bool enabled) {
+    if (&TCMalloc_Internal_SetReleasePartialAllocPagesEnabled != nullptr) {
+      TCMalloc_Internal_SetReleasePartialAllocPagesEnabled(enabled);
+    }
+  }
+
+  const MallocExtension::BytesPerSecond old_rate_;
+  ThreadPtr thread_;
+};
+
+// Releases free memory under the given policy and returns how long that took. For
+// kBackgroundThread, runs the background thread until it has released expected_bytes (or more
+// than enough time has passed for that).
+int64_t ReleaseWithPolicy(ReleasePolicy policy, size_t expected_bytes) {
   auto start = NowNs();
-  if (chunk_bytes == 0) {
-    MallocExtension::ReleaseMemoryToSystem(std::numeric_limits<size_t>::max());
-  } else {
-    for (size_t released = 0; released < bytes; released += chunk_bytes) {
-      MallocExtension::ReleaseMemoryToSystem(chunk_bytes);
+  switch (policy) {
+    case ReleasePolicy::kGcLoop:
+      GcLoop();
+      break;
+    case ReleasePolicy::kOneCall:
+      MallocExtension::ReleaseMemoryToSystem(std::numeric_limits<size_t>::max());
+      break;
+    case ReleasePolicy::kBackgroundThread: {
+      const auto unmapped_before = UnmappedBytes();
+      const auto deadline =
+          Clock::now() + std::chrono::seconds(3 + expected_bytes / kBackgroundReleaseRate);
+      BackgroundThread background_thread(kBackgroundReleaseRate);
+      while (UnmappedBytes() < unmapped_before + expected_bytes * 9 / 10 &&
+             Clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      break;
     }
   }
   return NowNs() - start;
@@ -199,7 +287,6 @@ class HoleyHeap {
     // Only use hugepages that hold nothing but our objects: anything else allocated in between
     // would land in our holes or keep them from being released.
     std::unordered_map<uintptr_t, std::vector<void*>> by_hugepage;
-    std::vector<void*> spare;
     size_t full = 0;
     for (size_t allocated = 0; full < hugepages; ++allocated) {
       CHECK_LT(allocated, 4 * hugepages * kPagesPerHugePage + 10000) << "Could not fill hugepages";
@@ -251,11 +338,15 @@ struct Sample {
   int64_t duration_ns;
 };
 
+bool Overlaps(const Sample& sample, int64_t begin_ns, int64_t end_ns) {
+  return sample.start_ns < end_ns && sample.start_ns + sample.duration_ns > begin_ns;
+}
+
 // Longest of the samples that overlap [begin_ns, end_ns).
 double MaxOverlappingMs(const std::vector<Sample>& samples, int64_t begin_ns, int64_t end_ns) {
   int64_t max_ns = 0;
   for (const auto& sample : samples) {
-    if (sample.start_ns < end_ns && sample.start_ns + sample.duration_ns > begin_ns) {
+    if (Overlaps(sample, begin_ns, end_ns)) {
       max_ns = std::max(max_ns, sample.duration_ns);
     }
   }
@@ -266,8 +357,7 @@ size_t CountOverlappingAtLeast(
     const std::vector<Sample>& samples, int64_t begin_ns, int64_t end_ns, int64_t min_ns) {
   size_t count = 0;
   for (const auto& sample : samples) {
-    if (sample.start_ns < end_ns && sample.start_ns + sample.duration_ns > begin_ns &&
-        sample.duration_ns >= min_ns) {
+    if (Overlaps(sample, begin_ns, end_ns) && sample.duration_ns >= min_ns) {
       ++count;
     }
   }
@@ -324,16 +414,16 @@ void AllocateFromPageHeap() {
 
 constexpr auto kProbeInterval = std::chrono::microseconds(50);
 
-// Args: hugepages, hole_pages, chunk_kib. Half of each hugepage is freed in holes of hole_pages
-// pages, then released in one call (chunk_kib = 0) or in chunk_kib calls like the old MemTracker
-// GC loop. Time is the release; lock_wait_max_ms is the longest a probe thread waited for
-// pageheap_lock while it ran.
+// Args: hugepages, hole_pages, policy. Half of each hugepage is freed in holes of hole_pages
+// pages, long enough ago that skip-subrelease no longer protects them, then released under the
+// policy. Time is how long the release took; *_wait_max_ms is the longest a probe thread waited
+// for pageheap_lock meanwhile.
 void BM_ReleaseHoleyHugepages(benchmark::State& state) {
   const size_t hugepages = state.range(0);
   const size_t hole_pages = state.range(1);
-  const size_t chunk_bytes = state.range(2) * 1_KB;
+  const auto policy = static_cast<ReleasePolicy>(state.range(2));
 
-  ScopedZeroSkipSubrelease zero_skip_subrelease;
+  ScopedSkipSubrelease zero_skip_subrelease;
   double stats_wait_max_ms = 0;
   double alloc_wait_max_ms = 0;
   double released_mib = 0;
@@ -342,20 +432,20 @@ void BM_ReleaseHoleyHugepages(benchmark::State& state) {
   for (auto _ : state) {
     HoleyHeap heap(hugepages, hole_pages);
     holes = heap.holes();
-    auto unmapped_before = GetProperty("tcmalloc.pageheap_unmapped_bytes");
+    auto unmapped_before = UnmappedBytes();
 
     Prober stats_prober(ReadAllocatedBytes, kProbeInterval);
     Prober alloc_prober(AllocateFromPageHeap, kProbeInterval);
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     auto release_start = NowNs();
-    auto release_ns = Release(heap.hole_bytes(), chunk_bytes);
+    auto release_ns = ReleaseWithPolicy(policy, heap.hole_bytes());
     auto release_end = release_start + release_ns;
     stats_wait_max_ms = std::max(
         stats_wait_max_ms, MaxOverlappingMs(stats_prober.Stop(), release_start, release_end));
     alloc_wait_max_ms = std::max(
         alloc_wait_max_ms, MaxOverlappingMs(alloc_prober.Stop(), release_start, release_end));
 
-    released_mib += UnmappedMiBSince(unmapped_before);
+    released_mib += BytesToMiB(UnmappedBytes() - unmapped_before);
     total_release_ns += release_ns;
     state.SetIterationTime(release_ns / 1e9);
   }
@@ -363,17 +453,28 @@ void BM_ReleaseHoleyHugepages(benchmark::State& state) {
   const auto iterations = static_cast<double>(state.iterations());
   state.counters["holes"] = holes;
   state.counters["released_mib"] = released_mib / iterations;
-  state.counters["us_per_hole"] = total_release_ns / 1e3 / iterations / holes;
+  state.counters["us_per_released_mib"] = total_release_ns / 1e3 / std::max(released_mib, 1.0);
   state.counters["stats_wait_max_ms"] = stats_wait_max_ms;
   state.counters["alloc_wait_max_ms"] = alloc_wait_max_ms;
   SetLabel(state);
 }
 
+void ReleaseHoleyHugepagesArgs(benchmark::internal::Benchmark* b) {
+  for (auto hole_pages : {1, 4, 16, 64, 128}) {
+    for (auto policy : {ReleasePolicy::kOneCall, ReleasePolicy::kGcLoop}) {
+      for (auto hugepages : {64, 512}) {
+        b->Args({hugepages, hole_pages, static_cast<int64_t>(policy)});
+      }
+    }
+    // The background thread releases 16 MiB per second however big the heap is.
+    b->Args({64, hole_pages, static_cast<int64_t>(ReleasePolicy::kBackgroundThread)});
+  }
+}
+
 BENCHMARK(BM_ReleaseHoleyHugepages)
-    ->ArgNames({"hugepages", "hole_pages", "chunk_kib"})
-    ->ArgsProduct({{64, 512}, {1, 4, 16, 64, 128}, {0}})
-    ->Args({64, 1, 1024})
-    ->Iterations(10)
+    ->ArgNames({"hugepages", "hole_pages", "policy"})
+    ->Apply(ReleaseHoleyHugepagesArgs)
+    ->Iterations(5)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 
@@ -399,18 +500,18 @@ constexpr size_t kLockWaiterThreads = 4;
 constexpr auto kLockThreadPause = std::chrono::microseconds(100);
 constexpr size_t kSampledSmallAllocationsInterval = 64_KB;
 
-// Args: hugepages, chunk_kib, work. kLockHolderThreads threads repeatedly take a simple_spinlock
+// Args: hugepages, policy, work. kLockHolderThreads threads repeatedly take a simple_spinlock
 // (the type of PeerMessageQueue::queue_lock_) and do the given work under it, while
 // kLockWaiterThreads threads take it only to bump a counter. Meanwhile the main thread releases
-// half of the given hugepages in one-page holes. waiter_wait_max_ms is the longest a thread that
-// never allocates waited for the lock during the release; baseline_wait_max_ms is the same before
-// the release started.
+// half of the given hugepages, freed in one-page holes, under the policy. waiter_wait_max_ms is
+// the longest a thread that never allocates waited for the lock during the release;
+// baseline_wait_max_ms is the same in the 100 ms before it.
 void BM_RaftLockConvoy(benchmark::State& state) {
   const size_t hugepages = state.range(0);
-  const size_t chunk_bytes = state.range(1) * 1_KB;
+  const auto policy = static_cast<ReleasePolicy>(state.range(1));
   const auto work = static_cast<LockHolderWork>(state.range(2));
 
-  ScopedZeroSkipSubrelease zero_skip_subrelease;
+  ScopedSkipSubrelease zero_skip_subrelease;
   const auto sampling_interval = MallocExtension::GetProfileSamplingInterval();
   double waiter_wait_max_ms = 0;
   double baseline_wait_max_ms = 0;
@@ -460,7 +561,7 @@ void BM_RaftLockConvoy(benchmark::State& state) {
     auto baseline_start = NowNs();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     auto release_start = NowNs();
-    auto release_ns = Release(heap.hole_bytes(), chunk_bytes);
+    auto release_ns = ReleaseWithPolicy(policy, heap.hole_bytes());
     auto release_end = release_start + release_ns;
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     stop.store(true, std::memory_order_release);
@@ -491,9 +592,12 @@ void BM_RaftLockConvoy(benchmark::State& state) {
 }
 
 BENCHMARK(BM_RaftLockConvoy)
-    ->ArgNames({"hugepages", "chunk_kib", "work"})
-    ->ArgsProduct({{128}, {0, 1024}, {0, 1, 2}})
-    ->Iterations(5)
+    ->ArgNames({"hugepages", "policy", "work"})
+    ->ArgsProduct({{128},
+                   {static_cast<int64_t>(ReleasePolicy::kGcLoop),
+                    static_cast<int64_t>(ReleasePolicy::kBackgroundThread)},
+                   {0, 1, 2}})
+    ->Iterations(3)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 
@@ -546,9 +650,9 @@ constexpr size_t kReuseBytes = 256_MB;
 constexpr auto kReuseDelay = std::chrono::milliseconds(100);
 
 // Args: object_kib, release. Frees kReuseBytes of objects, releases the freed memory to the OS
-// right away if release is 1 (what TCMalloc's background thread does over time, or a
-// synchronous GC does at once), and allocates and touches the same amount again kReuseDelay
-// later. Time is the reallocation; minor_faults are those taken during it.
+// right away if release is 1, and allocates and touches the same amount again kReuseDelay later.
+// This is the cost per released byte that any policy pays when the memory is needed again. Time
+// is the reallocation; minor_faults are those taken during it.
 void BM_ReuseAfterRelease(benchmark::State& state) {
   const size_t object_size = state.range(0) * 1_KB;
   const bool release = state.range(1);
@@ -561,12 +665,12 @@ void BM_ReuseAfterRelease(benchmark::State& state) {
   for (auto _ : state) {
     FreeAll(&objects);
     FlushFrontEndCaches();
-    auto unmapped_before = GetProperty("tcmalloc.pageheap_unmapped_bytes");
+    auto unmapped_before = UnmappedBytes();
     if (release) {
-      ScopedZeroSkipSubrelease zero_skip_subrelease;
+      ScopedSkipSubrelease zero_skip_subrelease;
       MallocExtension::ReleaseMemoryToSystem(kReuseBytes);
     }
-    released_mib += UnmappedMiBSince(unmapped_before);
+    released_mib += BytesToMiB(UnmappedBytes() - unmapped_before);
     std::this_thread::sleep_for(kReuseDelay);
 
     RusageDelta rusage(RUSAGE_THREAD);
@@ -590,58 +694,38 @@ BENCHMARK(BM_ReuseAfterRelease)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 
-// Runs TCMalloc's ProcessBackgroundActions loop on its own thread, as yb-tserver does with
-// --tcmalloc_background_thread, until destroyed.
-class BackgroundThread {
- public:
-  explicit BackgroundThread(size_t release_bytes_per_sec)
-      : old_rate_(MallocExtension::GetBackgroundReleaseRate()) {
-    MallocExtension::SetBackgroundReleaseRate(
-        MallocExtension::BytesPerSecond{release_bytes_per_sec});
-    MallocExtension::SetBackgroundProcessActionsEnabled(true);
-    thread_ = CHECK_RESULT(Thread::Make(
-        "tcmalloc", "tcmalloc_bkgrnd", [] { MallocExtension::ProcessBackgroundActions(); }));
-  }
-
-  ~BackgroundThread() {
-    MallocExtension::SetBackgroundProcessActionsEnabled(false);
-    thread_->Join();
-    MallocExtension::SetBackgroundReleaseRate(old_rate_);
-  }
-
- private:
-  const MallocExtension::BytesPerSecond old_rate_;
-  ThreadPtr thread_;
-};
-
 constexpr size_t kChurnBytes = 256_MB;
 constexpr size_t kChurnObjectSize = 32_KB;
 constexpr auto kChurnIdle = std::chrono::milliseconds(100);
 
-// Args: rate_mib_per_sec, zero_skip_subrelease. Each iteration allocates and touches kChurnBytes,
-// frees it and idles for kChurnIdle, while TCMalloc's background thread releases free memory at
-// the given rate (0 = no background thread). zero_skip_subrelease = 1 lets it release memory that
-// was in use within TCMalloc's lookbacks. Time is the allocation; minor_faults are those taken
-// during it; cpu_ms is the whole process's CPU time per iteration, including the background
-// thread's.
-void BM_BackgroundReleaseChurn(benchmark::State& state) {
-  const size_t rate = state.range(0) * 1_MB;
+// Args: policy, zero_skip_subrelease. Each iteration allocates and touches kChurnBytes, frees it
+// and idles for kChurnIdle, while the policy releases free memory: kGcLoop runs the GC loop after
+// every kGcReleaseBytes freed, with this TCMalloc's skip-subrelease intervals;
+// kBackgroundThread runs the background thread with --tcmalloc_background_thread's intervals.
+// zero_skip_subrelease = 1 sets the intervals to 0 instead, so that free memory is released even
+// if it was in use a moment ago. Time is the allocation; minor_faults are those taken during it;
+// cpu_ms is the whole process's CPU time per iteration, including the background thread's.
+void BM_ReleaseChurn(benchmark::State& state) {
+  const auto policy = static_cast<ReleasePolicy>(state.range(0));
   const bool zero_skip_subrelease = state.range(1);
 
   ReleaseAll();
-  std::optional<ScopedZeroSkipSubrelease> zero_skip_subrelease_scope;
+  std::optional<ScopedSkipSubrelease> skip_subrelease;
   if (zero_skip_subrelease) {
-    zero_skip_subrelease_scope.emplace();
+    skip_subrelease.emplace();
+  } else if (policy == ReleasePolicy::kBackgroundThread) {
+    skip_subrelease.emplace(kBackgroundSkipSubreleaseShort, kBackgroundSkipSubreleaseLong);
   }
   InterleavedResidents residents(kChurnBytes, kChurnObjectSize);
   std::optional<BackgroundThread> background_thread;
-  if (rate > 0) {
-    background_thread.emplace(rate);
+  if (policy == ReleasePolicy::kBackgroundThread) {
+    background_thread.emplace(kBackgroundReleaseRate);
   }
 
   RusageDelta process_rusage(RUSAGE_SELF);
   double minor_faults = 0;
   double allocate_max_ms = 0;
+  size_t freed_since_gc = 0;
   for (auto _ : state) {
     RusageDelta rusage(RUSAGE_THREAD);
     auto start = NowNs();
@@ -651,6 +735,13 @@ void BM_BackgroundReleaseChurn(benchmark::State& state) {
     allocate_max_ms = std::max(allocate_max_ms, NsToMs(allocate_ns));
     minor_faults += rusage.MinorFaults();
     FreeAll(&objects);
+    if (policy == ReleasePolicy::kGcLoop) {
+      freed_since_gc += kChurnBytes;
+      if (freed_since_gc > kGcReleaseBytes) {
+        freed_since_gc = 0;
+        GcLoop();
+      }
+    }
     std::this_thread::sleep_for(kChurnIdle);
   }
 
@@ -661,9 +752,11 @@ void BM_BackgroundReleaseChurn(benchmark::State& state) {
   SetLabel(state);
 }
 
-BENCHMARK(BM_BackgroundReleaseChurn)
-    ->ArgNames({"rate_mib_per_sec", "zero_skip_subrelease"})
-    ->ArgsProduct({{0, 16, 64}, {0, 1}})
+BENCHMARK(BM_ReleaseChurn)
+    ->ArgNames({"policy", "zero_skip_subrelease"})
+    ->ArgsProduct({{static_cast<int64_t>(ReleasePolicy::kGcLoop),
+                    static_cast<int64_t>(ReleasePolicy::kBackgroundThread)},
+                   {0, 1}})
     ->Iterations(50)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
