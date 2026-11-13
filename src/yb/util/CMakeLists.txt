@@ -553,3 +553,4 @@ YB_TEST_TARGET_LINK_LIBRARIES(uint_set-test proto_container_test_proto)
 #######################################
 
 ADD_YB_BENCHMARK(mutex-benchmark DEPS absl)
+ADD_YB_BENCHMARK(tcmalloc-benchmark DEPS absl)
