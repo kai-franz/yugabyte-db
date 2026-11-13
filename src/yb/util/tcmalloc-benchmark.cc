@@ -36,6 +36,8 @@
 
 #include <sys/resource.h>
 
+#include <benchmark/benchmark.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -48,15 +50,15 @@
 #include <unordered_map>
 #include <vector>
 
-#include <benchmark/benchmark.h>
-
 #include "yb/gutil/sysinfo.h"
 
 #include "yb/util/format.h"
 #include "yb/util/locks.h"
 #include "yb/util/logging.h"
 #include "yb/util/size_literals.h"
+#include "yb/util/status_log.h"
 #include "yb/util/tcmalloc_impl_util.h"
+#include "yb/util/thread.h"
 
 #if YB_GOOGLE_TCMALLOC
 
@@ -277,29 +279,33 @@ size_t CountOverlappingAtLeast(
 class Prober {
  public:
   Prober(std::function<void()> op, std::chrono::microseconds interval)
-      : thread_([this, op = std::move(op), interval] {
-          while (!stop_.load(std::memory_order_acquire)) {
-            auto start = NowNs();
-            op();
-            samples_.push_back({start, NowNs() - start});
-            std::this_thread::sleep_for(interval);
-          }
-        }) {}
+      : thread_(CHECK_RESULT(Thread::Make(
+            "tcmalloc", "prober", [this, op = std::move(op), interval] { Run(op, interval); }))) {}
 
   ~Prober() { Stop(); }
 
   const std::vector<Sample>& Stop() {
     stop_.store(true, std::memory_order_release);
-    if (thread_.joinable()) {
-      thread_.join();
+    if (thread_) {
+      thread_->Join();
+      thread_ = nullptr;
     }
     return samples_;
   }
 
  private:
+  void Run(const std::function<void()>& op, std::chrono::microseconds interval) {
+    while (!stop_.load(std::memory_order_acquire)) {
+      auto start = NowNs();
+      op();
+      samples_.push_back({start, NowNs() - start});
+      std::this_thread::sleep_for(interval);
+    }
+  }
+
   std::atomic<bool> stop_{false};
   std::vector<Sample> samples_;
-  std::thread thread_;
+  ThreadPtr thread_;
 };
 
 // Reading TCMalloc's statistics takes pageheap_lock, as the root MemTracker's consumption functor
@@ -422,9 +428,9 @@ void BM_RaftLockConvoy(benchmark::State& state) {
     std::atomic<bool> stop{false};
     std::vector<std::vector<Sample>> waits(kLockHolderThreads + kLockWaiterThreads);
     std::vector<std::vector<Sample>> holds(kLockHolderThreads);
-    std::vector<std::thread> threads;
+    std::vector<ThreadPtr> threads;
     for (size_t i = 0; i != kLockHolderThreads + kLockWaiterThreads; ++i) {
-      threads.emplace_back([&, i] {
+      threads.push_back(CHECK_RESULT(Thread::Make("tcmalloc", "raft_lock", [&, i] {
         const bool holder = i < kLockHolderThreads;
         while (!stop.load(std::memory_order_acquire)) {
           auto start = NowNs();
@@ -448,7 +454,7 @@ void BM_RaftLockConvoy(benchmark::State& state) {
           }
           std::this_thread::sleep_for(kLockThreadPause);
         }
-      });
+      })));
     }
 
     auto baseline_start = NowNs();
@@ -459,7 +465,7 @@ void BM_RaftLockConvoy(benchmark::State& state) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     stop.store(true, std::memory_order_release);
     for (auto& thread : threads) {
-      thread.join();
+      thread->Join();
     }
     MallocExtension::SetProfileSamplingInterval(sampling_interval);
 
@@ -593,18 +599,19 @@ class BackgroundThread {
     MallocExtension::SetBackgroundReleaseRate(
         MallocExtension::BytesPerSecond{release_bytes_per_sec});
     MallocExtension::SetBackgroundProcessActionsEnabled(true);
-    thread_ = std::thread([] { MallocExtension::ProcessBackgroundActions(); });
+    thread_ = CHECK_RESULT(Thread::Make(
+        "tcmalloc", "tcmalloc_bkgrnd", [] { MallocExtension::ProcessBackgroundActions(); }));
   }
 
   ~BackgroundThread() {
     MallocExtension::SetBackgroundProcessActionsEnabled(false);
-    thread_.join();
+    thread_->Join();
     MallocExtension::SetBackgroundReleaseRate(old_rate_);
   }
 
  private:
   const MallocExtension::BytesPerSecond old_rate_;
-  std::thread thread_;
+  ThreadPtr thread_;
 };
 
 constexpr size_t kChurnBytes = 256_MB;
