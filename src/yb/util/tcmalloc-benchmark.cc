@@ -17,11 +17,15 @@
 // - BM_ReleaseHoleyHugepages: how long a release holds pageheap_lock when the free memory is
 //   scattered over hugepages as many small holes. TCMalloc unbacks each hole with its own
 //   madvise() call.
+// - BM_ReleaseHugepagesDirect: the same from one hugepage up, with a thread that takes the lock
+//   in a tight loop, so its longest wait is the longest single hold.
 // - BM_RaftLockConvoy: threads that allocate while holding a lock of their own, like
 //   PeerMessageQueue::ResponseFromPeer under queue_lock_, wait for pageheap_lock during such a
 //   release, and so stall threads that only need their lock and never allocate.
 // - BM_ReuseAfterRelease: what it costs to fault memory back in when it is allocated again 100 ms
 //   after it was freed and released.
+// - BM_ReuseAfterBackgroundRelease: the same when TCMalloc's background thread released the
+//   memory.
 // - BM_ReleaseChurn: the same cost while the process keeps freeing and reallocating memory and
 //   the server's release policy runs.
 //
@@ -42,6 +46,7 @@
 
 #include <benchmark/benchmark.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -368,12 +373,15 @@ size_t CountOverlappingAtLeast(
   return count;
 }
 
-// Runs op on its own thread every interval until Stop(), and records when each call started and
-// how long it took.
+// Runs op on its own thread every interval (back to back if zero) until Stop(), and records when
+// each call started and how long it took.
 class Prober {
  public:
+  // Reserves room for the samples up front: growing the vector while measuring would allocate from
+  // the page heap and change what a release finds to release.
   Prober(std::function<void()> op, std::chrono::microseconds interval)
-      : thread_(CHECK_RESULT(Thread::Make(
+      : samples_(Reserved(interval)),
+        thread_(CHECK_RESULT(Thread::Make(
             "tcmalloc", "prober", [this, op = std::move(op), interval] { Run(op, interval); }))) {}
 
   ~Prober() { Stop(); }
@@ -393,8 +401,16 @@ class Prober {
       auto start = NowNs();
       op();
       samples_.push_back({start, NowNs() - start});
-      std::this_thread::sleep_for(interval);
+      if (interval.count() > 0) {
+        std::this_thread::sleep_for(interval);
+      }
     }
+  }
+
+  static std::vector<Sample> Reserved(std::chrono::microseconds interval) {
+    std::vector<Sample> samples;
+    samples.reserve(interval.count() > 0 ? 1 << 18 : 1 << 21);
+    return samples;
   }
 
   std::atomic<bool> stop_{false};
@@ -406,6 +422,12 @@ class Prober {
 // does, so how long this takes is how long the reader waited for the lock.
 void ReadAllocatedBytes() {
   benchmark::DoNotOptimize(GetProperty("generic.current_allocated_bytes"));
+}
+
+// Reading the free page heap bytes takes pageheap_lock and reads one field, so it costs next to
+// nothing beyond the wait for the lock.
+void ReadPageHeapFreeBytes() {
+  benchmark::DoNotOptimize(GetProperty("tcmalloc.pageheap_free_bytes"));
 }
 
 constexpr auto kProbeInterval = std::chrono::microseconds(50);
@@ -476,6 +498,54 @@ BENCHMARK(BM_ReleaseHoleyHugepages)
     ->Iterations(5)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
+
+// Args: hugepages, hole_pages. Hugepages with kPagesPerHugePage / (2 * hole_pages) holes each,
+// released in one call while a prober takes pageheap_lock back to back. Time is the release call.
+// On a TCMalloc that holds pageheap_lock for the whole call, the prober's longest wait matches
+// it; on one that drops the lock around each madvise(), the longest wait is the longest single
+// hold.
+void BM_ReleaseHugepagesDirect(benchmark::State& state) {
+  const size_t hugepages = state.range(0);
+  const size_t hole_pages = state.range(1);
+
+  ScopedSkipSubrelease zero_skip_subrelease;
+  std::vector<double> wait_us;
+  std::vector<double> release_us;
+  double released_kib = 0;
+  for (auto _ : state) {
+    HoleyHeap heap(hugepages, hole_pages);
+    Prober prober(ReadPageHeapFreeBytes, std::chrono::microseconds(0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    auto unmapped_before = UnmappedBytes();
+    auto start = NowNs();
+    MallocExtension::ReleaseMemoryToSystem(std::numeric_limits<size_t>::max());
+    auto end = NowNs();
+    wait_us.push_back(MaxOverlappingMs(prober.Stop(), start, end) * 1e3);
+    release_us.push_back((end - start) / 1e3);
+    released_kib += BytesToMiB(UnmappedBytes() - unmapped_before) * 1024;
+    state.SetIterationTime((end - start) / 1e9);
+  }
+
+  auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+  };
+  state.counters["holes"] = hugepages * kPagesPerHugePage / (2 * hole_pages);
+  state.counters["released_kib"] = released_kib / state.iterations();
+  state.counters["release_us_p50"] = median(release_us);
+  state.counters["release_us_per_hole"] =
+      median(release_us) / (hugepages * kPagesPerHugePage / (2 * hole_pages));
+  state.counters["lock_wait_us_p50"] = median(wait_us);
+  state.counters["lock_wait_us_max"] = *std::max_element(wait_us.begin(), wait_us.end());
+  SetLabel(state);
+}
+
+BENCHMARK(BM_ReleaseHugepagesDirect)
+    ->ArgNames({"hugepages", "hole_pages"})
+    ->ArgsProduct({{1, 4, 16, 64}, {1, 4, 16, 128}})
+    ->Iterations(100)
+    ->UseManualTime()
+    ->Unit(benchmark::kMicrosecond);
 
 // What the threads in BM_RaftLockConvoy that hold the lock do with it.
 enum class LockHolderWork {
@@ -690,6 +760,68 @@ BENCHMARK(BM_ReuseAfterRelease)
     ->ArgNames({"object_kib", "release"})
     ->ArgsProduct({{32, 4096}, {0, 1}})
     ->Iterations(10)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+
+constexpr size_t kBackgroundReuseBytes = 64_MB;
+
+// Args: object_kib, release. Frees kBackgroundReuseBytes of objects; with release = 1, waits until
+// TCMalloc's background thread (set up as for --tcmalloc_background_thread) has released them,
+// then waits kReuseDelay more and allocates and touches the same amount again. With release = 0
+// there is no background thread and only the kReuseDelay wait. Skip-subrelease is off, standing
+// for memory that stayed free longer than its intervals. Time is the reallocation; minor_faults
+// are those taken during it; release_wait_s is how long the background thread took.
+void BM_ReuseAfterBackgroundRelease(benchmark::State& state) {
+  const size_t object_size = state.range(0) * 1_KB;
+  const bool release = state.range(1);
+
+  ReleaseAll();
+  ScopedSkipSubrelease zero_skip_subrelease;
+  InterleavedResidents residents(kBackgroundReuseBytes, object_size);
+  std::optional<BackgroundThread> background_thread;
+  if (release) {
+    background_thread.emplace(kBackgroundReleaseRate);
+  }
+  double minor_faults = 0;
+  double released_mib = 0;
+  double release_wait_s = 0;
+  auto objects = AllocateAndTouch(kBackgroundReuseBytes, object_size);
+  for (auto _ : state) {
+    FreeAll(&objects);
+    FlushFrontEndCaches();
+    auto unmapped_before = UnmappedBytes();
+    if (release) {
+      auto wait_start = NowNs();
+      const auto deadline = Clock::now() +
+          std::chrono::seconds(3 + kBackgroundReuseBytes / kBackgroundReleaseRate);
+      while (UnmappedBytes() < unmapped_before + kBackgroundReuseBytes * 9 / 10 &&
+             Clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      release_wait_s += (NowNs() - wait_start) / 1e9;
+    }
+    released_mib += BytesToMiB(UnmappedBytes() - unmapped_before);
+    std::this_thread::sleep_for(kReuseDelay);
+
+    RusageDelta rusage(RUSAGE_THREAD);
+    auto start = NowNs();
+    objects = AllocateAndTouch(kBackgroundReuseBytes, object_size);
+    state.SetIterationTime((NowNs() - start) / 1e9);
+    minor_faults += rusage.MinorFaults();
+  }
+  FreeAll(&objects);
+
+  const auto iterations = static_cast<double>(state.iterations());
+  state.counters["minor_faults"] = minor_faults / iterations;
+  state.counters["released_mib"] = released_mib / iterations;
+  state.counters["release_wait_s"] = release_wait_s / iterations;
+  SetLabel(state);
+}
+
+BENCHMARK(BM_ReuseAfterBackgroundRelease)
+    ->ArgNames({"object_kib", "release"})
+    ->ArgsProduct({{32, 4096}, {0, 1}})
+    ->Iterations(5)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 
